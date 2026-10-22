@@ -48,6 +48,12 @@
 #define PARSE_STATUS_OK                     1
 #define UNDEFINED_SLOT                      -1
 #define PROTO_INLINE_MAX_SIZE               (1024*64)
+/* SCAN cursors returned to clients encode the master node index in the last
+ * 4 decimal digits. The real Redis cursor is stored as (cursor + 1) in the
+ * remaining digits, so that cursors for the first node are never represented
+ * with leading zeroes (which are lost by clients treating cursors as numbers).
+ * The final cursor for the whole cluster is still plain 0. */
+#define SCAN_CURSOR_NODE_BASE               10000ULL
 
 #define MAX_ACCEPTS                         1000
 #define NET_IP_STR_LEN                      46
@@ -816,13 +822,12 @@ final:
 }
 
 /* Scan all master nodes in the cluster. Node order is alphabeticallty and it's
- * taken from `clusterGetMasterNames`. The index of the node is taken from the
- * cursor last 4 digits. If the index is beyond the list of all the master
- * the choosen node will be the last one. If the cursor is '0', the choosen
- * node will be the first one. This special cursor format will be handled by
- * `handleScanReply`, that will append the index of the node to scan to the
- * cursor replied from the cluster. The real cursor sent to the cluster won't
- * actually contain the index suffix. */
+ * taken from `clusterGetMasterNames`. Cursors are encoded by `handleScanReply`
+ * as `(real_cursor + 1) * SCAN_CURSOR_NODE_BASE + node_index`, where the last
+ * 4 decimal digits are the node index. If the index is beyond the list of all
+ * the masters the choosen node will be the last one. If the cursor is '0', the
+ * choosen node will be the first one. The real cursor sent to the cluster
+ * won't contain the node index suffix. */
 int scanCommand(void *r) {
     clientRequest *req = r;
     client *c = req->client;
@@ -837,44 +842,48 @@ int scanCommand(void *r) {
     int status = PROXY_COMMAND_UNHANDLED;
     sds cursor = sdsnewlen(req->buffer + req->offsets[1], req->lengths[1]);
     char *errptr = NULL;
-    uint64_t cursor_n = strtoll(cursor, &errptr, 10);
+    uint64_t encoded_cursor = strtoull(cursor, &errptr, 10);
+    uint64_t real_cursor = 0;
     int idx = 0;
-    if (cursor_n == 0) {
-        if (errptr && *errptr != '\0') {
-            proxyLogDebug("Invalid SCAN cursor: '%s'. (errptr: '%s')",
-                          cursor, errptr);
+    if (errptr && *errptr != '\0') {
+        proxyLogDebug("Invalid SCAN cursor: '%s'. (errptr: '%s')",
+                      cursor, errptr);
+        addReplyError(c, ERROR_INVALID_QUERY, req->id);
+        status = PROXY_COMMAND_HANDLED;
+        goto final;
+    }
+    if (encoded_cursor != 0) {
+        if (encoded_cursor < SCAN_CURSOR_NODE_BASE) {
+            /* Compatibility with cursors produced by older proxy versions:
+             * transitions to the next node were encoded as 4 digits with
+             * leading zeroes, which numeric clients normalized to 1, 2, ... */
+            idx = (int) encoded_cursor;
+        } else {
+            idx = (int) (encoded_cursor % SCAN_CURSOR_NODE_BASE);
+            real_cursor = encoded_cursor / SCAN_CURSOR_NODE_BASE - 1;
+        }
+        /* Replace the encoded cursor with the real cursor that has to be sent
+         * to the node. */
+        int crslen = sdslen(cursor);
+        sds realstr = sdscatprintf(sdsempty(), "%llu",
+                                   (unsigned long long) real_cursor);
+        char *p = req->buffer + req->offsets[1] + crslen;
+        sds remaining = sdsnew(p);
+        p = req->buffer + req->offsets[1];
+        while (p > req->buffer && *p != '$') p--;
+        if (p <= req->buffer) {
             addReplyError(c, ERROR_INVALID_QUERY, req->id);
+            sdsfree(realstr);
+            sdsfree(remaining);
             status = PROXY_COMMAND_HANDLED;
             goto final;
         }
-    } else {
-        /* Take the last 4-digits in the cursor: they'll be used as the
-         * node index */
-         int crslen = sdslen(cursor);
-         if (crslen > 4) {
-            int prefixlen = crslen - 4;
-            char *p = cursor + prefixlen;
-            /* Read the node index */
-            idx = atoi(p);
-            p = req->buffer + req->offsets[1] + crslen;
-            sds remaining = sdsnew(p);
-            sdsrange(cursor, 0, prefixlen - 1);
-            p = req->buffer + req->offsets[1];
-            while (*p != '$' && p > req->buffer) p--;
-            if (p <= req->buffer) {
-                addReplyError(c, ERROR_INVALID_QUERY, req->id);
-                sdsfree(remaining);
-                status = PROXY_COMMAND_HANDLED;
-                goto final;
-            }
-            /* Remove the index suffix from the buffer that has to be sent
-             * to the node. */
-            sdsrange(req->buffer, 0, p - req->buffer);
-            req->buffer = sdscatfmt(req->buffer, "%u\r\n%S%S",
-                                    (unsigned int) prefixlen,
-                                    cursor, remaining);
-            sdsfree(remaining);
-         }
+        sdsrange(req->buffer, 0, p - req->buffer);
+        req->buffer = sdscatfmt(req->buffer, "%u\r\n%S%S",
+                                (unsigned int) sdslen(realstr),
+                                realstr, remaining);
+        sdsfree(realstr);
+        sdsfree(remaining);
     }
     redisCluster *cluster = getCluster(c);
     list *node_names = clusterGetMasterNames(cluster);
@@ -1382,9 +1391,11 @@ int sumReplies(void *_reply, void *_req, char *buf, int len) {
  * node (the one associated with the request). When reply will contain a zero
  * cursor, the scan for the current node is completed, so choose the next node
  * in the list, or just reply the zero cursor to the client if there's no
- * another nodes left. The index of the choosen node (the index is relative to
- * the alphabetically sorted list of masters) is then appended to the cursor
- * contained in the reply, as a 4-digits suffix. */
+ * another nodes left. The cursor contained in the reply is then encoded as
+ * `(real_cursor + 1) * SCAN_CURSOR_NODE_BASE + node_index`, where the node
+ * index is relative to the alphabetically sorted list of masters. Adding 1
+ * to the real cursor guarantees that the encoded cursor never starts with a
+ * zero, so clients that treat cursors as numbers won't lose the node index. */
 int handleScanReply(void *_reply, void *_req, char *buf, int len) {
     UNUSED(_reply);
     int status = PROXY_REPLY_UNHANDLED;
@@ -1427,8 +1438,8 @@ int handleScanReply(void *_reply, void *_req, char *buf, int len) {
     }
     cursor = sdsnewlen(crsptr, crslen);
     char *errptr = NULL;
-    uint64_t cursor_n = strtoll(cursor, &errptr, 10);
-    if (cursor_n == 0 && errptr && *errptr != '\0') {
+    uint64_t cursor_n = strtoull(cursor, &errptr, 10);
+    if (errptr && *errptr != '\0') {
         err = ERROR_INVALID_REPLY;
         goto final;
     }
@@ -1464,8 +1475,15 @@ int handleScanReply(void *_reply, void *_req, char *buf, int len) {
             goto final;
         }
     }
-    cursor = sdscatprintf(cursor, "%.04d", idx);
-    crslen = sdslen(cursor);
+    if (cursor_n > (UINT64_MAX / SCAN_CURSOR_NODE_BASE) - 1) {
+        err = ERROR_INVALID_REPLY;
+        goto final;
+    }
+    uint64_t encoded_cursor = (cursor_n + 1) * SCAN_CURSOR_NODE_BASE +
+                              (uint64_t) idx;
+    sdsfree(cursor);
+    cursor = sdscatprintf(sdsempty(), "%llu",
+                          (unsigned long long) encoded_cursor);
     remaining = sdsnewlen(p, len - (p - buffer));
     sdsrange(buffer, 0, (lenptr - 1) - buffer);
     buffer = sdscatfmt(buffer, "%u\r\n%S%S", sdslen(cursor), cursor, remaining);
