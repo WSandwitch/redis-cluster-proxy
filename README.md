@@ -1,8 +1,16 @@
 # Redis Cluster Proxy
 
-> This is a fork of RedisLabs's cluster proxy. It includes additional commit with pseudo support for the `INFO` and `SELECT` commands, allowing the proxy to work with libraries that use those commands to initialize the client (with `SELECT`) and check the health of the client (with `INFO`).
-> - `SELECT` will be a no-op.
-> - `INFO` will return the info from a random master in the cluster.
+> This is a fork of RedisLabs's cluster proxy, targeting compatibility with **Redis 7.2** (the last BSD-licensed Redis 7.x release) so that it can be used as a drop-in replacement for a single Redis instance in RESP2 mode.
+>
+> Main differences from the original proxy:
+> - `SELECT 0` is accepted; `SELECT` with a non-zero DB returns an error, since a Redis Cluster only has DB 0.
+> - `INFO` returns the info of the first master node plus the proxy's own sections.
+> - `HELLO 2` is supported (RESP2); `HELLO 3` returns `NOPROTO`.
+> - `CLIENT SETNAME/GETNAME/ID/INFO/SETINFO`, `QUIT`, `RESET`, `READONLY`, `READWRITE` and `ASKING` are handled locally.
+> - `CONFIG`, `SCRIPT` and `FUNCTION` are supported (`CONFIG SET`, `SCRIPT LOAD/FLUSH/EXISTS` and `FUNCTION` mutations are broadcast to all masters).
+> - Cross-slot queries are enabled by default (they are not atomic; see below).
+> - Pub/Sub is not supported yet: Pub/Sub commands return an explicit unsupported-command error.
+> - RESP3, client-side caching (`CLIENT TRACKING`), `SELECT db > 0` and cluster administration commands are not supported.
 >
 > It also integrates various pull requests with **bug fixes** (see commits list for details).
 >
@@ -23,8 +31,8 @@ So, these are the main features of Redis Cluster Proxy:
 - Multithreaded
 - Both multiplexing and private connection models supported
 - Query execution and reply order are guaranteed even in multiplexing contexts
-- Automatic update of the cluster's configuration after `ASK|MOVED` errors: when those kinds of errors occur in replies, the proxy automatically updates its internal representation of the cluster by fetching an updated configuration of it and by remapping all the slots. All queries will be re-executed after the update is completed, so that, from the client's point-of-view, everything flows as normal (the clients won't receive the ASK|MOVED error: they will directly receive the expected replies after the cluster configuration has been updated).
-- Cross-slot/Cross-node queries: many commands involving multiple keys belonging to different slots (or even to different cluster nodes) are supported. Those commands will split the query into multiple queries that will be routed to different slots/nodes. Reply handling for those commands is command-specific. Some commands, such as `MGET`, will merge all the replies as if they were a single reply. Other commands such as `MSET` or `DEL` will sum the results of all the replies. Since those queries actually break the atomicity of the command, their usage is optional (disabled by default). See below for more info.
+- Automatic update of the cluster's configuration after `MOVED` errors: when those kinds of errors occur in replies, the proxy automatically updates its internal representation of the cluster by fetching an updated configuration of it and by remapping all the slots. All queries will be re-executed after the update is completed, so that, from the client's point-of-view, everything flows as normal (the clients won't receive the MOVED error: they will directly receive the expected replies after the cluster configuration has been updated). `ASK` replies are handled without a full reconfiguration: the request is re-sent to the indicated node prefixed with `ASKING`.
+- Cross-slot/Cross-node queries: many commands involving multiple keys belonging to different slots (or even to different cluster nodes) are supported. Those commands will split the query into multiple queries that will be routed to different slots/nodes. Reply handling for those commands is command-specific. Some commands, such as `MGET`, will merge all the replies as if they were a single reply. Other commands such as `MSET` or `DEL` will sum the results of all the replies. Since those queries actually break the atomicity of the command, they are enabled by default but can be disabled with `--disable-cross-slot` (see below). **WARNING**: cross-slot queries are not atomic: if a client disconnects or a node fails in the middle of a cross-slot query, only part of it may be executed.
 - Some commands with no specific node/slot such as `DBSIZE` are delivered to all the nodes and the replies will be map-reduced in order to give a sum of all the values contained in all the replies.
 - The additional `PROXY` command that can be used to perform some proxy-specific actions.
 
@@ -172,11 +180,12 @@ The proxy will use these credentials to authenticate to the cluster and fetch th
 So, **all clients** that will connect to the proxy will be **automatically authenticated** with the user that is specified by `--auth-user` or with the `default` user if no user has been specified, **without the need** to call the `AUTH` command by themselves.
 Anyway, if any client wants to be authenticated with a different user, it always can call the Redis `AUTH` command (documented [here](https://redis.io/commands/auth)): in this case, the client will use a private connection instead of the shared, multiplexed connection, and it will authenticate with another user.
 
-# Enabling cross-slots queries
+# Cross-slots queries
 
 Cross-slots queries use multiple keys belonging to different slots or even different nodes.
-Since their execution is not guaranteed to be atomic (so, they can actually break the atomic design of many Redis commands), they are disabled by default.
-Anyway, if you don't mind about atomicity and you want this feature, you can enable it when you launch the proxy by using the `--enable-cross-slot`, or by setting `enable-cross-slot yes` into your config file. You can also activate this feature while the proxy is running by using the special `PROXY` command (see below).
+Since their execution is not guaranteed to be atomic (so, they can actually break the atomic design of many Redis commands), they are **enabled by default** to make the proxy behave like a regular Redis instance. You can disable them with the `--disable-cross-slot` option, or by setting `disable-cross-slot yes` in your config file. You can also change this behavior while the proxy is running by using the special `PROXY` command (see below).
+
+**WARNING**: cross-slot queries are not atomic. If the client disconnects or a node fails while the query is being executed, only part of the command may be applied.
 
 **Note**: cross-slots queries are not supported by all the commands, even if the feature is enabled (ie. you cannot use it with `EVAL` or `ZUNIONSTORE` and many other commands). In that case, you'll receive a specific error reply. You can fetch a list of commands that cannot be used in cross-slots queries by using the `PROXY` command (see below).
 
@@ -310,7 +319,7 @@ The `PROXY` command will allow you to get specific info or perform actions that 
 - DBSIZE: sends the query to all nodes in the cluster and sums their replies,
           so that the result will be the total number of keys in the whole
           cluster.
-- SCAN: performs the scan on all the master nodes of the cluster. The **cursor** contained in the reply will have a special four-digits suffix indicating the index of the node that has to be scanned. **Note**: sometimes the cursor could be something like "00001", so you mustn't convert it to an integer when your client has to use it to perform the next scan.
+- SCAN: performs the scan on all the master nodes of the cluster. The cursor returned to the client encodes both the real Redis cursor and the index of the node that has to be scanned next, as `(real_cursor + 1) * 10000 + node_index`. Cursors are plain decimal numbers, so clients can safely convert them to integers. The final cursor (when the scan is complete) is `0`.
 
 For a list of all known commands (both supported and unsupported) and their 
 features, see [COMMANDS.md](COMMANDS.md)

@@ -102,6 +102,8 @@ clusterNode *searchNodeBySlot(redisCluster *cluster, int slot);
 clusterNode *getNodeByKey(redisCluster *cluster, char *key, int keylen,
                           int *getslot);
 clusterNode *getNodeByName(redisCluster *cluster, const char *name);
+clusterNode *getNodeByAddress(redisCluster *cluster, const char *ip,
+                              int port);
 clusterNode *getFirstMappedNode(redisCluster *cluster);
 list *clusterGetMasterNames(redisCluster *cluster);
 int updateCluster(redisCluster *cluster);

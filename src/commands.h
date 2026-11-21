@@ -29,6 +29,9 @@
 #define CMDFLAG_MULTISLOT_UNSUPPORTED 1 << 0
 #define CMDFLAG_DUPLICATE 1 << 1
 #define CMDFLAG_HANDLE_REPLY 1 << 2
+/* Route commands without keys to the first master node, even when they take
+ * arguments (eg. LASTSAVE, TIME, ROLE). */
+#define CMDFLAG_FIRST_MASTER 1 << 3
 
 typedef int redisClusterProxyCommandHandler(void *request);
 typedef int redisClusterProxyReplyHandler(void *reply, void *request,
@@ -62,6 +65,6 @@ typedef struct redisCommandDef {
 } redisCommandDef;
 
 
-extern struct redisCommandDef redisCommandTable[203];
+extern struct redisCommandDef redisCommandTable[245];
 
 #endif /* __REDIS_CLUSTER_PROXY_COMMANDS_H__  */

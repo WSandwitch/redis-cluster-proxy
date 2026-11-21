@@ -43,6 +43,12 @@
 #define PROXY_MAIN_THREAD_ID -1
 #define PROXY_UNKN_THREAD_ID -999
 
+/* Child requests are created to handle commands that need to be sent to
+ * multiple nodes (multiple replies or cross-slot queries). Their IDs are only
+ * used as keys in the parent's `child_replies` rax and must never be used as
+ * client reply IDs, since reply ordering is based on the client requests'
+ * sequential IDs. For this reason child requests use a separate ID space. */
+#define CHILD_REQUEST_ID_BASE (1ULL << 63)
 #define getClientLoop(c) (proxy.threads[c->thread_id]->loop)
 
 struct client;
@@ -85,9 +91,12 @@ typedef struct clientRequest {
     int parsed;
     int owned_by_client;
     int closes_transaction;
+    int asking;
+    int ask_retries;
+    int force_node;
+    int duplicated;
     list *child_requests;
     rax  *child_replies;
-    uint64_t max_child_reply_id;
     struct clientRequest *parent_request;
     /* Pointers to *listNode used in various list. They allow to quickly
      * have a reference to the node instead of searching it via listSearchKey.
@@ -125,6 +134,7 @@ typedef struct client {
     sds ip;
     int port;
     sds addr;
+    sds name;                      /* Client name (CLIENT SETNAME) */
     int thread_id;
     sds obuf;
     size_t written;
@@ -133,6 +143,7 @@ typedef struct client {
     int has_write_handler;
     int flags;
     uint64_t next_request_id;
+    uint64_t next_child_request_id;
     struct clientRequest *current_request; /* Currently reading */
     uint64_t min_reply_id;
     rax *unordered_replies;

@@ -14,6 +14,10 @@ end
 
 test "Verify cross-slot queries status" do
     spawn_clients(1){|client, idx|
+        # Cross-slot is enabled by default: disable it explicitly for this
+        # test, since the following tests verify the disabled behavior first.
+        reply = client.proxy 'config', 'set', 'enable-cross-slot', '0'
+        assert_not_redis_err(reply)
         reply = client.proxy 'config', 'get', 'enable-cross-slot'
         assert_not_redis_err(reply)
         assert_class(reply, Array)

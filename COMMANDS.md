@@ -2,20 +2,30 @@
 
 ## Supported Commands
 
+Those commands are supported by Redis Cluster Proxy.
+
  - APPEND
+ - ASKING
  - AUTH
  - BGREWRITEAOF
  - BGSAVE
  - BITCOUNT
  - BITFIELD
+ - BITFIELD_RO
  - BITOP
  - BITPOS
+ - BLMOVE (**disables multiplexing**)
+ - BLMPOP (**disables multiplexing**)
  - BLPOP (**disables multiplexing**)
  - BRPOP (**disables multiplexing**)
- - BRPOPLPUSH
+ - BRPOPLPUSH (**disables multiplexing**)
+ - BZMPOP (**disables multiplexing**)
  - BZPOPMAX (**disables multiplexing**)
  - BZPOPMIN (**disables multiplexing**)
+ - CLIENT
  - COMMAND
+ - CONFIG
+ - COPY
  - DBSIZE (**sums multiple replies**)
  - DECR
  - DECRBY
@@ -25,12 +35,18 @@
  - ECHO
  - EVAL
  - EVALSHA
+ - EVALSHA_RO
+ - EVAL_RO
  - EXEC
  - EXISTS (**sums multiple replies**)
  - EXPIRE
  - EXPIREAT
+ - EXPIRETIME
+ - FCALL
+ - FCALL_RO
  - FLUSHALL
  - FLUSHDB
+ - FUNCTION
  - GEOADD
  - GEODIST
  - GEOHASH
@@ -39,11 +55,16 @@
  - GEORADIUSBYMEMBER
  - GEORADIUSBYMEMBER_RO
  - GEORADIUS_RO
+ - GEOSEARCH
+ - GEOSEARCHSTORE
  - GET
  - GETBIT
+ - GETDEL
+ - GETEX
  - GETRANGE
  - GETSET
  - HDEL
+ - HELLO
  - HEXISTS
  - HGET
  - HGETALL
@@ -54,6 +75,7 @@
  - HMGET
  - HMSET
  - HOST:
+ - HRANDFIELD
  - HSCAN
  - HSET
  - HSETNX
@@ -62,13 +84,18 @@
  - INCR
  - INCRBY
  - INCRBYFLOAT
+ - INFO
  - KEYS (**merges multiple replies**)
  - LASTSAVE
+ - LCS
  - LINDEX
  - LINSERT
  - LLEN
+ - LMOVE
+ - LMPOP
  - LOLWUT
  - LPOP
+ - LPOS
  - LPUSH
  - LPUSHX
  - LRANGE
@@ -84,6 +111,7 @@
  - PERSIST
  - PEXPIRE
  - PEXPIREAT
+ - PEXPIRETIME
  - PFADD
  - PFCOUNT
  - PFMERGE
@@ -91,11 +119,16 @@
  - POST
  - PSETEX
  - PTTL
+ - QUIT
  - RANDOMKEY
+ - READONLY
+ - READWRITE
  - RENAME
  - RENAMENX
+ - RESET
  - RESTORE
  - RESTORE-ASKING
+ - ROLE
  - RPOP
  - RPOPLPUSH
  - RPUSH
@@ -104,6 +137,7 @@
  - SAVE
  - SCAN
  - SCARD
+ - SCRIPT
  - SDIFF
  - SDIFFSTORE (**cross-slots unsupported**)
  - SELECT
@@ -113,11 +147,14 @@
  - SETNX
  - SETRANGE
  - SINTER
+ - SINTERCARD (**cross-slots unsupported**)
  - SINTERSTORE (**cross-slots unsupported**)
  - SISMEMBER
  - SMEMBERS
+ - SMISMEMBER
  - SMOVE
  - SORT
+ - SORT_RO
  - SPOP
  - SRANDMEMBER
  - SREM
@@ -127,6 +164,7 @@
  - SUNION
  - SUNIONSTORE (**cross-slots unsupported**)
  - SWAPDB
+ - TIME
  - TOUCH (**sums multiple replies**)
  - TTL
  - TYPE
@@ -135,6 +173,7 @@
  - WATCH (**disables multiplexing**)
  - XACK
  - XADD
+ - XAUTOCLAIM
  - XCLAIM
  - XDEL
  - XGROUP
@@ -150,14 +189,22 @@
  - ZADD
  - ZCARD
  - ZCOUNT
+ - ZDIFF (**cross-slots unsupported**)
+ - ZDIFFSTORE (**cross-slots unsupported**)
  - ZINCRBY
+ - ZINTER (**cross-slots unsupported**)
+ - ZINTERCARD
  - ZINTERSTORE (**cross-slots unsupported**)
  - ZLEXCOUNT
+ - ZMPOP
+ - ZMSCORE
  - ZPOPMAX
  - ZPOPMIN
+ - ZRANDMEMBER
  - ZRANGE
  - ZRANGEBYLEX
  - ZRANGEBYSCORE
+ - ZRANGESTORE
  - ZRANK
  - ZREM
  - ZREMRANGEBYLEX
@@ -169,20 +216,16 @@
  - ZREVRANK
  - ZSCAN
  - ZSCORE
+ - ZUNION (**cross-slots unsupported**)
  - ZUNIONSTORE (**cross-slots unsupported**)
-
 ## Unsupported Commands
 
 Those commands are currently not supported by Redis Cluster Proxy.
 
  - ACL
- - ASKING
- - CLIENT
  - CLUSTER
- - CONFIG
  - DEBUG
- - HELLO
- - INFO
+ - FAILOVER
  - LATENCY
  - MEMORY
  - MIGRATE
@@ -195,19 +238,17 @@ Those commands are currently not supported by Redis Cluster Proxy.
  - PUBLISH
  - PUBSUB
  - PUNSUBSCRIBE
- - READONLY
- - READWRITE
  - REPLCONF
  - REPLICAOF
- - ROLE
- - SCRIPT
+ - SENTINEL
  - SHUTDOWN
  - SLAVEOF
  - SLOWLOG
+ - SPUBLISH
+ - SSUBSCRIBE
  - SUBSCRIBE
+ - SUNSUBSCRIBE
  - SYNC
- - TIME
  - UNSUBSCRIBE
  - WAIT
-
-
+ - WAITAOF

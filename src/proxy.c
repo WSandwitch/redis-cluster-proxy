@@ -35,6 +35,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
 #include "assert.h" /* Use proxy's assert */
@@ -48,6 +49,8 @@
 #define PARSE_STATUS_OK                     1
 #define UNDEFINED_SLOT                      -1
 #define PROTO_INLINE_MAX_SIZE               (1024*64)
+#define MAX_ASK_RETRIES                     5
+#define PROXY_REDIS_COMPAT_VERSION          "7.2.0"
 /* SCAN cursors returned to clients encode the master node index in the last
  * 4 decimal digits. The real Redis cursor is stored as (cursor + 1) in the
  * remaining digits, so that cursors for the first node are never represented
@@ -101,7 +104,7 @@
 #define clientRequiresAuth(c) \
     ((c->auth_user && (!config.auth_user || strcmp(config.auth_user, c->auth_user))) || (config.auth_user && !c->auth_user))
 
-#define REQID_PRINTF_FMT "%d:%" PRId64 ":%" PRId64
+#define REQID_PRINTF_FMT "%d:%" PRIu64 ":%" PRIu64
 #define REQID_PRINTF_ARG(r) r->client->thread_id, r->client->id, r->id
 #define getClientPeerIP(c) (c->ip ? c->ip : config.unixsocket)
 #define strRepr(s) (sdscatrepr(sdsempty(), s, strlen(s)))
@@ -131,7 +134,7 @@ static void *execProxyThread(void *ptr);
 static client *createClient(int fd, char *ip);
 static void unlinkClient(client *c);
 static void freeClient(client *c);
-static clientRequest *createRequest(client *c);
+static clientRequest *createRequest(client *c, int is_child);
 void readQuery(aeEventLoop *el, int fd, void *privdata, int mask);
 static int writeToClient(client *c);
 static int writeToCluster(aeEventLoop *el, int fd, clientRequest *req);
@@ -160,6 +163,27 @@ void sigsegvHandler(int sig, siginfo_t *info, void *secret);
 /* Hiredis helpers */
 
 int processItem(redisReader *r);
+
+static sds requestArg(clientRequest *req, int idx);
+static int parseIntArg(sds arg, long long *out);
+static int duplicateRequestForAllMasters(clientRequest *req);
+
+static int addChildRequestReply(clientRequest *req, char *replybuf,
+                                int len);
+
+/* Add an error reply for `req`. Child requests (requests created to handle
+ * multiple replies or cross-slot queries) must never reply to the client
+ * directly, since their IDs are not part of the client reply sequence: in
+ * that case the error is added to the parent's collected replies.
+ * Return 1 if the caller must not free the request (because it's now owned by
+ * its parent or it has already been freed with it), 0 otherwise. */
+static int replyChildRequestError(clientRequest *req, const char *errmsg) {
+    if (req->parent_request == NULL) return 0;
+    sds errreply = sdscatprintf(sdsempty(), "-ERR %s\r\n", errmsg);
+    addChildRequestReply(req, errreply, sdslen(errreply));
+    sdsfree(errreply);
+    return 1;
+}
 
 /* This function does the same things as redisReaderGetReply, but
  * it does not trim the reader's buffer, in order to let the proxy's
@@ -727,14 +751,340 @@ int securityWarningCommand(void *r) {
 
 int pingCommand(void *r) {
     clientRequest *req = r;
-    addReplyString(req->client, "PONG", req->id);
+    if (req->argc > 1) {
+        sds msg = requestArg(req, 1);
+        if (msg != NULL) {
+            addReplyBulkStringLen(req->client, msg, sdslen(msg), req->id);
+            sdsfree(msg);
+        } else addReplyBulkString(req->client, "", req->id);
+    } else addReplyString(req->client, "PONG", req->id);
     return PROXY_COMMAND_HANDLED;
+}
+
+/* Return the argument at index `idx` of the request as a new sds, or NULL if
+ * the index is out of range. */
+static sds requestArg(clientRequest *req, int idx) {
+    if (idx < 0 || idx >= req->argc || idx >= req->offsets_size) return NULL;
+    return sdsnewlen(req->buffer + req->offsets[idx], req->lengths[idx]);
+}
+
+static int parseIntArg(sds arg, long long *out) {
+    char *endptr = NULL;
+    long long val;
+    if (arg == NULL || sdslen(arg) == 0) return 0;
+    val = strtoll(arg, &endptr, 10);
+    if (endptr == arg || *endptr != '\0') return 0;
+    *out = val;
+    return 1;
 }
 
 int selectCommand(void *r) {
     clientRequest *req = r;
+    client *c = req->client;
+    long long db = 0;
+    sds arg = requestArg(req, 1);
+    if (req->argc != 2 || arg == NULL) {
+        addReplyErrorWrongArgc(c, "select", req->id);
+    } else if (!parseIntArg(arg, &db)) {
+        addReplyError(c, "value is not an integer or out of range", req->id);
+    } else if (db != 0) {
+        /* Only DB 0 is supported, since a Redis Cluster has a single
+         * database. Returning an error prevents clients from silently
+         * operating on the wrong database. */
+        addReplyError(c, "SELECT is not allowed in cluster mode", req->id);
+    } else {
+        addReplyString(c, "OK", req->id);
+    }
+    if (arg != NULL) sdsfree(arg);
+    return PROXY_COMMAND_HANDLED;
+}
+
+int quitCommand(void *r) {
+    clientRequest *req = r;
+    addReplyString(req->client, "OK", req->id);
+    req->client->flags |= CLIENT_CLOSE_AFTER_REPLY;
+    return PROXY_COMMAND_HANDLED;
+}
+
+/* Handler for commands that are meaningless on the proxy but that clients may
+ * send as part of their cluster handshake (eg. READONLY, READWRITE, ASKING).
+ * Since the proxy only routes to master nodes, replying with OK is safe. */
+int okCommand(void *r) {
+    clientRequest *req = r;
     addReplyString(req->client, "OK", req->id);
     return PROXY_COMMAND_HANDLED;
+}
+
+int resetCommand(void *r) {
+    clientRequest *req = r;
+    client *c = req->client;
+    if (c->multi_transaction) {
+        addReplyError(c, "RESET is not allowed inside MULTI", req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    if (c->name != NULL) {
+        sdsfree(c->name);
+        c->name = NULL;
+    }
+    addReplyString(c, "RESET", req->id);
+    return PROXY_COMMAND_HANDLED;
+}
+
+int helloCommand(void *r) {
+    clientRequest *req = r;
+    client *c = req->client;
+    int i = 1, proto = 2;
+    sds setname = NULL, auth_user = NULL, auth_pass = NULL;
+    int proto_set = 0;
+    while (i < req->argc) {
+        sds arg = requestArg(req, i);
+        if (arg == NULL) break;
+        if (!strcasecmp(arg, "auth")) {
+            if (i + 2 >= req->argc) {
+                sdsfree(arg);
+                addReplyErrorWrongArgc(c, "hello", req->id);
+                return PROXY_COMMAND_HANDLED;
+            }
+            auth_user = requestArg(req, i + 1);
+            auth_pass = requestArg(req, i + 2);
+            i += 3;
+        } else if (!strcasecmp(arg, "setname")) {
+            if (i + 1 >= req->argc) {
+                sdsfree(arg);
+                if (auth_user) sdsfree(auth_user);
+                if (auth_pass) sdsfree(auth_pass);
+                addReplyErrorWrongArgc(c, "hello", req->id);
+                return PROXY_COMMAND_HANDLED;
+            }
+            if (setname != NULL) sdsfree(setname);
+            setname = requestArg(req, i + 1);
+            i += 2;
+        } else if (!proto_set) {
+            long long val = 0;
+            if (!parseIntArg(arg, &val)) {
+                sdsfree(arg);
+                addReplyError(c, "Protocol version is not an integer or out "
+                              "of range", req->id);
+                if (auth_user) sdsfree(auth_user);
+                if (auth_pass) sdsfree(auth_pass);
+                return PROXY_COMMAND_HANDLED;
+            }
+            proto = (int) val;
+            proto_set = 1;
+            i++;
+        } else {
+            sdsfree(arg);
+            addReplyError(c, "Syntax error in HELLO", req->id);
+            if (auth_user) sdsfree(auth_user);
+            if (auth_pass) sdsfree(auth_pass);
+            if (setname) sdsfree(setname);
+            return PROXY_COMMAND_HANDLED;
+        }
+        sdsfree(arg);
+    }
+    if (proto != 2) {
+        addReplyErrorLen(c, "-NOPROTO unsupported protocol version",
+                         strlen("-NOPROTO unsupported protocol version"),
+                         req->id);
+        if (auth_user) sdsfree(auth_user);
+        if (auth_pass) sdsfree(auth_pass);
+        if (setname) sdsfree(setname);
+        return PROXY_COMMAND_HANDLED;
+    }
+    if (auth_user != NULL) {
+        int ok = 1;
+        if (config.auth != NULL) {
+            const char *expected_user = config.auth_user ?
+                                        config.auth_user : "default";
+            ok = (!strcmp(auth_user, expected_user) &&
+                  !strcmp(auth_pass ? auth_pass : "", config.auth));
+        }
+        if (!ok) {
+            addReplyErrorLen(c, "-WRONGPASS invalid username-password pair "
+                             "or user is disabled.",
+                             strlen("-WRONGPASS invalid username-password "
+                                    "pair or user is disabled."), req->id);
+            sdsfree(auth_user);
+            if (auth_pass) sdsfree(auth_pass);
+            if (setname) sdsfree(setname);
+            return PROXY_COMMAND_HANDLED;
+        }
+    }
+    if (setname != NULL) {
+        if (sdslen(setname) == 0) {
+            /* An empty name resets the client's name, like in Redis. */
+            sdsfree(setname);
+            if (c->name != NULL) {
+                sdsfree(c->name);
+                c->name = NULL;
+            }
+        } else {
+            if (c->name != NULL) sdsfree(c->name);
+            c->name = sdsdup(setname);
+            sdsfree(setname);
+        }
+    }
+    if (auth_user) sdsfree(auth_user);
+    if (auth_pass) sdsfree(auth_pass);
+    sds reply = sdscatfmt(sdsempty(),
+        "*14\r\n"
+        "$6\r\nserver\r\n$5\r\nredis\r\n"
+        "$7\r\nversion\r\n$%u\r\n%s\r\n"
+        "$5\r\nproto\r\n:2\r\n"
+        "$2\r\nid\r\n:%U\r\n"
+        "$4\r\nmode\r\n$7\r\ncluster\r\n"
+        "$4\r\nrole\r\n$6\r\nmaster\r\n"
+        "$7\r\nmodules\r\n*0\r\n",
+        (unsigned int) strlen(PROXY_REDIS_COMPAT_VERSION),
+        PROXY_REDIS_COMPAT_VERSION,
+        (unsigned long long) c->id);
+    addReplyRaw(c, reply, sdslen(reply), req->id);
+    sdsfree(reply);
+    return PROXY_COMMAND_HANDLED;
+}
+
+int clientCommand(void *r) {
+    clientRequest *req = r;
+    client *c = req->client;
+    sds sub = requestArg(req, 1);
+    if (sub == NULL) {
+        addReplyErrorUnknownSubcommand(c, "CLIENT", "CLIENT HELP", req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    if (!strcasecmp(sub, "setname")) {
+        if (req->argc != 3) {
+            addReplyErrorWrongArgc(c, "client|setname", req->id);
+        } else {
+            sds name = requestArg(req, 2);
+            /* An empty name resets the client's name, like in Redis. */
+            if (name != NULL && sdslen(name) == 0) {
+                sdsfree(name);
+                name = NULL;
+            }
+            if (c->name != NULL) sdsfree(c->name);
+            c->name = name;
+            addReplyString(c, "OK", req->id);
+        }
+    } else if (!strcasecmp(sub, "getname")) {
+        if (c->name != NULL)
+            addReplyBulkString(c, c->name, req->id);
+        else addReplyNull(c, req->id);
+    } else if (!strcasecmp(sub, "id")) {
+        addReplyInt(c, (int64_t) c->id, req->id);
+    } else if (!strcasecmp(sub, "info")) {
+        sds info = sdscatfmt(sdsempty(),
+            "id=%U addr=%s laddr=%s fd=%i name=%s age=0 idle=0 flags=N "
+            "db=0 sub=0 psub=0 ssub=0 multi=%i qbuf=0 qbuf-free=0 argv-mem=0 "
+            "multi-mem=0 rbs=0 rbp=0 obl=0 oll=0 omem=0 tot-mem=0 events=r "
+            "cmd=client|info user=default redir=-1 resp=2 lib-name= lib-ver=",
+            (unsigned long long) c->id,
+            c->addr ? c->addr : "",
+            c->addr ? c->addr : "",
+            c->fd,
+            c->name ? c->name : "",
+            c->multi_transaction ? -1 : 0);
+        addReplyBulkString(c, info, req->id);
+        sdsfree(info);
+    } else if (!strcasecmp(sub, "setinfo")) {
+        if (req->argc != 4) {
+            addReplyErrorWrongArgc(c, "client|setinfo", req->id);
+        } else addReplyString(c, "OK", req->id);
+    } else if (!strcasecmp(sub, "getredir")) {
+        addReplyInt(c, -1, req->id);
+    } else if (!strcasecmp(sub, "unblock")) {
+        addReplyInt(c, 0, req->id);
+    } else if (!strcasecmp(sub, "tracking") ||
+               !strcasecmp(sub, "caching") ||
+               !strcasecmp(sub, "trackinginfo") ||
+               !strcasecmp(sub, "no-evict") ||
+               !strcasecmp(sub, "no-touch") ||
+               !strcasecmp(sub, "pause") ||
+               !strcasecmp(sub, "unpause") ||
+               !strcasecmp(sub, "kill") ||
+               !strcasecmp(sub, "list") ||
+               !strcasecmp(sub, "reply") ||
+               !strcasecmp(sub, "help"))
+    {
+        sds err = sdscatfmt(sdsempty(),
+            "CLIENT %s is not supported by the proxy", sub);
+        addReplyError(c, err, req->id);
+        sdsfree(err);
+    } else {
+        addReplyErrorUnknownSubcommand(c, "CLIENT", "CLIENT HELP", req->id);
+    }
+    sdsfree(sub);
+    return PROXY_COMMAND_HANDLED;
+}
+
+/* Route the current request to the first master node. */
+static int routeToFirstMaster(clientRequest *req) {
+    redisCluster *cluster = getCluster(req->client);
+    clusterNode *node = getFirstMappedNode(cluster);
+    if (node == NULL) return 0;
+    req->node = node;
+    req->force_node = 1;
+    return 1;
+}
+
+/* Duplicate the current request for all the master nodes. */
+static int broadcastToAllMasters(clientRequest *req) {
+    if (!duplicateRequestForAllMasters(req)) return 0;
+    req->force_node = 1;
+    return 1;
+}
+
+int configCommand(void *r) {
+    clientRequest *req = r;
+    client *c = req->client;
+    sds sub = requestArg(req, 1);
+    int routed = 0, handled = 0;
+    if (sub == NULL) {
+        addReplyErrorUnknownSubcommand(c, "CONFIG", "CONFIG HELP", req->id);
+        handled = 1;
+    } else if (!strcasecmp(sub, "get") || !strcasecmp(sub, "help")) {
+        routed = routeToFirstMaster(req);
+    } else if (!strcasecmp(sub, "set") || !strcasecmp(sub, "resetstat") ||
+               !strcasecmp(sub, "rewrite"))
+    {
+        routed = broadcastToAllMasters(req);
+    } else {
+        addReplyErrorUnknownSubcommand(c, "CONFIG", "CONFIG HELP", req->id);
+        handled = 1;
+    }
+    if (!handled && !routed) {
+        addReplyError(c, ERROR_NO_NODE, req->id);
+        handled = 1;
+    }
+    if (sub != NULL) sdsfree(sub);
+    return (handled ? PROXY_COMMAND_HANDLED : PROXY_COMMAND_UNHANDLED);
+}
+
+int scriptCommand(void *r) {
+    clientRequest *req = r;
+    client *c = req->client;
+    sds sub = requestArg(req, 1);
+    int routed = 0, handled = 0;
+    if (sub == NULL) {
+        addReplyErrorUnknownSubcommand(c, "SCRIPT", "SCRIPT HELP", req->id);
+        handled = 1;
+    } else if (!strcasecmp(sub, "load") || !strcasecmp(sub, "exists") ||
+               !strcasecmp(sub, "flush"))
+    {
+        /* Scripts must be loaded on all the master nodes, otherwise EVALSHA
+         * would fail depending on the node a key is routed to. */
+        routed = broadcastToAllMasters(req);
+    } else if (!strcasecmp(sub, "kill") || !strcasecmp(sub, "help")) {
+        routed = routeToFirstMaster(req);
+    } else {
+        addReplyErrorUnknownSubcommand(c, "SCRIPT", "SCRIPT HELP", req->id);
+        handled = 1;
+    }
+    if (!handled && !routed) {
+        addReplyError(c, ERROR_NO_NODE, req->id);
+        handled = 1;
+    }
+    if (sub != NULL) sdsfree(sub);
+    return (handled ? PROXY_COMMAND_HANDLED : PROXY_COMMAND_UNHANDLED);
 }
 
 int multiCommand(void *r) {
@@ -1185,7 +1535,6 @@ final:
         sdsfree(err);
     }
     if (subcmd != NULL) sdsfree(subcmd);
-    freeRequest(req);
     return PROXY_COMMAND_HANDLED;
 }
 
@@ -1262,7 +1611,6 @@ final:
         reply = sdscatfmt(sdsempty(), "*%u\r\n%S", count, merged_replies);
         addReplyRaw(req->client, reply, sdslen(reply), req->id);
     }
-    req->client->min_reply_id = req->max_child_reply_id + 1;
     if (reply) sdsfree(reply);
     sdsfree(merged_replies);
     return ok;
@@ -1297,7 +1645,6 @@ int getFirstMultipleReply(void *_reply, void *_req, char *buf, int len) {
     raxStop(&iter);
     if (first) {
         addReplyRaw(req->client, first, sdslen(first), req->id);
-        req->client->min_reply_id = req->max_child_reply_id + 1;
     } else return 0;
     return 1;
 }
@@ -1309,37 +1656,25 @@ int getRandomReply(void *_reply, void *_req, char *buf, int len) {
     clientRequest *req = _req;
     raxIterator iter;
     raxStart(&iter, req->child_replies);
-    sds random_reply = NULL;
-    while (random_reply == NULL) {
-        if (raxSize(req->child_replies) == 0) break;
-        if (!raxSeek(&iter, "^", NULL, 0)) {
-            raxStop(&iter);
-            char *err = (errno == ENOMEM ? ERROR_OOM :
-                                           ERROR_MULTIPLE_REPLIES_ITER_FAIL);
-            addReplyError(req->client, err, req->id);
-            return 0;
-        }
-        if (!raxRandomWalk(&iter, 0)) {
-            raxStop(&iter);
-            char *err = (errno == ENOMEM ? ERROR_OOM :
-                                           ERROR_MULTIPLE_REPLIES_ITER_FAIL);
-            addReplyError(req->client, err, req->id);
-            return 0;
-        }
+    sds selected = NULL;
+    unsigned long long count = 0;
+    if (raxSeek(&iter, "^", NULL, 0)) {
         while (raxNext(&iter)) {
-            random_reply = (sds) iter.data;
-            if (random_reply == NULL ||random_reply[0] == '-') {
-                if (raxRemove(req->child_replies, iter.key, iter.key_len, NULL))
-                    raxSeek(&iter,">",iter.key,iter.key_len);
-                continue;
-            }
-            if (random_reply != NULL)  break;
+            sds child_reply = (sds) iter.data;
+            if (child_reply == NULL) continue;
+            /* Skip errors and null replies (the key does not exist on that
+             * node). */
+            if (child_reply[0] == '-') continue;
+            if (!strncmp(child_reply, "$-1\r\n", 5)) continue;
+            count++;
+            /* Reservoir sampling: pick the current reply with probability
+             * 1/count, so that the resulting reply is uniformly random. */
+            if ((random() % count) == 0) selected = child_reply;
         }
     }
     raxStop(&iter);
-    if (random_reply == NULL) addReplyNull(req->client, req->id);
-    else addReplyRaw(req->client, random_reply, sdslen(random_reply), req->id);
-    req->client->min_reply_id = req->max_child_reply_id + 1;
+    if (selected == NULL) addReplyNull(req->client, req->id);
+    else addReplyRaw(req->client, selected, sdslen(selected), req->id);
     return 1;
 }
 
@@ -1379,7 +1714,6 @@ int sumReplies(void *_reply, void *_req, char *buf, int len) {
     }
     raxStop(&iter);
     addReplyInt(req->client, tot, req->id);
-    req->client->min_reply_id = req->max_child_reply_id + 1;
     return 1;
 }
 
@@ -1655,9 +1989,40 @@ int evalGetKeys(void *r, int *first_key, int *last_key, int *key_step,
     sds numkeys_s = sdsnewlen(req->buffer + req->offsets[2], req->lengths[2]);
     numkeys = atoi(numkeys_s);
     *first_key = 3;
-    *last_key = 3 + numkeys;
+    *last_key = 2 + numkeys;
     *key_step = 1;
     sdsfree(numkeys_s);
+    return numkeys;
+}
+
+/* Get keys for commands whose syntax is:
+ *   <cmd> <numkeys> <key> [<key> ...] [<other args>]
+ * (eg. ZUNION, ZINTER, ZDIFF, SINTERCARD, ZINTERCARD, LMPOP, ZMPOP). */
+int numkeysGetKeys(void *r, int *first_key, int *last_key, int *key_step,
+                   int **skip, int *skiplen, char **err)
+{
+    clientRequest *req = r;
+    UNUSED(skip);
+    UNUSED(skiplen);
+    if (req->argc < 3) {
+        if (err) *err = "Wrong number of arguments";
+        return -1;
+    }
+    if (req->offsets_size < 3) {
+        if (err) *err = "Invalid request format";
+        return -1;
+    }
+    sds numkeys_s = sdsnewlen(req->buffer + req->offsets[1],
+                              req->lengths[1]);
+    int numkeys = atoi(numkeys_s);
+    sdsfree(numkeys_s);
+    if (numkeys <= 0) {
+        if (err) *err = "Invalid request format";
+        return -1;
+    }
+    *first_key = 2;
+    *last_key = 1 + numkeys;
+    *key_step = 1;
     return numkeys;
 }
 
@@ -1808,6 +2173,8 @@ int parseOptions(int argc, char **argv) {
             }
         } else if (!strcmp("--enable-cross-slot", arg)) {
             config.cross_slot_enabled = 1;
+        } else if (!strcmp("--disable-cross-slot", arg)) {
+            config.cross_slot_enabled = 0;
         } else if (!strcmp("--help", arg) || !strcmp("-h", arg)) {
             printHelp();
             exit(0);
@@ -2555,6 +2922,7 @@ static client *createClient(int fd, char *ip) {
     c->ip = ip ? sdsnew(ip) : NULL;
     c->port = 0;
     c->addr = NULL;
+    c->name = NULL;
     c->obuf = sdsempty();
     c->reply_array = NULL;
     c->current_request = NULL;
@@ -2571,6 +2939,7 @@ static client *createClient(int fd, char *ip) {
     if (proxy.threads[c->thread_id]->next_client_id == UINT64_MAX)
         proxy.threads[c->thread_id]->next_client_id = 0;
     c->next_request_id = 0;
+    c->next_child_request_id = 0;
     c->min_reply_id = 0;
     c->requests_with_write_handler = 0;
     c->requests_to_reprocess = listCreate();
@@ -2678,7 +3047,7 @@ static int disableMultiplexingForClient(client *c) {
             req->node = node;
             int *p_ok = NULL;
             addObjectToList(req, node->connection, requests_to_send, p_ok);
-            listDelNode(conn->requests_to_send, ln);
+            listDelNode(conn->requests_to_send, rln);
             req->owned_by_client = 1;
         }
         if (c->pending_multiplex_requests == 0) {
@@ -2831,6 +3200,7 @@ static void freeClient(client *c) {
     removeObjectFromList(c, thread, clients);
     if (c->ip != NULL) sdsfree(c->ip);
     if (c->addr != NULL) sdsfree(c->addr);
+    if (c->name != NULL) sdsfree(c->name);
     if (c->obuf != NULL) sdsfree(c->obuf);
     if (c->reply_array != NULL) listRelease(c->reply_array);
     if (c->current_request) freeRequest(c->current_request);
@@ -2914,8 +3284,10 @@ static void writeToClusterHandler(aeEventLoop *el, int fd, void *privdata,
     if (connection->authenticating) {
         if (redisBufferWrite(ctx, NULL) == REDIS_ERR) {
             if (req != NULL) {
-                addReplyError(req->client, "AUTH failed", req->id);
-                freeRequest(req);
+                if (!replyChildRequestError(req, "AUTH failed")) {
+                    addReplyError(req->client, "AUTH failed", req->id);
+                    freeRequest(req);
+                }
             }
         }
         return;
@@ -2925,9 +3297,11 @@ static void writeToClusterHandler(aeEventLoop *el, int fd, void *privdata,
         if (req != NULL) {
             sds err = sdsnew(ERROR_NODE_DISCONNECTED);
             err = sdscatprintf(err, "%s:%d", ip, port);
-            addReplyError(req->client, err, req->id);
+            if (!replyChildRequestError(req, err)) {
+                addReplyError(req->client, err, req->id);
+                freeRequest(req);
+            }
             sdsfree(err);
-            freeRequest(req);
         }
         return;
     }
@@ -2938,9 +3312,11 @@ static void writeToClusterHandler(aeEventLoop *el, int fd, void *privdata,
             proxyLogErr("Failed to create read reply handler for node %s:%d",
                         ip, port);
             if (req != NULL) {
-                addReplyError(req->client, ERROR_CLUSTER_READ_FAIL,
-                              req->id);
-                freeRequest(req);
+                if (!replyChildRequestError(req, ERROR_CLUSTER_READ_FAIL)) {
+                    addReplyError(req->client, ERROR_CLUSTER_READ_FAIL,
+                                  req->id);
+                    freeRequest(req);
+                }
             }
             return;
         } else  {
@@ -2988,8 +3364,10 @@ static void writeToClusterHandler(aeEventLoop *el, int fd, void *privdata,
             if (autherr) {
                 proxyLogDebug("AUTH: %s", autherr);
                 if (req) {
-                    addReplyError(req->client, autherr, req->id);
-                    freeRequest(req);
+                    if (!replyChildRequestError(req, autherr)) {
+                        addReplyError(req->client, autherr, req->id);
+                        freeRequest(req);
+                    }
                 }
                 zfree(autherr);
             }
@@ -3045,8 +3423,11 @@ static int writeToCluster(aeEventLoop *el, int fd, clientRequest *req) {
             if ((errno == EPIPE) || (errno == ECONNREFUSED)) {
                 clusterNodeDisconnect(req->node);
             } else {
-                addReplyError(req->client, ERROR_CLUSTER_WRITE_FAIL, req->id);
-                freeRequest(req);
+                if (!replyChildRequestError(req, ERROR_CLUSTER_WRITE_FAIL)) {
+                    addReplyError(req->client, ERROR_CLUSTER_WRITE_FAIL,
+                                  req->id);
+                    freeRequest(req);
+                }
             }
             return 0;
         }
@@ -3089,8 +3470,11 @@ static int writeToCluster(aeEventLoop *el, int fd, clientRequest *req) {
             proxyLogDebug("Could not enqueue pending request "
                           REQID_PRINTF_FMT,
                           REQID_PRINTF_ARG(req));
-            addReplyError(req->client, "Could not enqueue request", req->id);
-            freeRequest(req);
+            if (!replyChildRequestError(req, "Could not enqueue request")) {
+                addReplyError(req->client, "Could not enqueue request",
+                              req->id);
+                freeRequest(req);
+            }
             return 0;
         }
         if (config.dump_queues) dumpQueue(node, thread_id, QUEUE_TYPE_PENDING);
@@ -3111,10 +3495,12 @@ static int writeToCluster(aeEventLoop *el, int fd, clientRequest *req) {
         if (!installIOHandler(el, fd, AE_WRITABLE, writeToClusterHandler,
             req->node, 0))
         {
-            addReplyError(req->client, ERROR_CLUSTER_WRITE_FAIL, req->id);
             proxyLogErr("Failed to create write handler for request "
                 REQID_PRINTF_FMT, REQID_PRINTF_ARG(req));
-            freeRequest(req);
+            if (!replyChildRequestError(req, ERROR_CLUSTER_WRITE_FAIL)) {
+                addReplyError(req->client, ERROR_CLUSTER_WRITE_FAIL, req->id);
+                freeRequest(req);
+            }
             return 0;
         }
         req->has_write_handler = 1;
@@ -3171,9 +3557,11 @@ void onClusterNodeDisconnection(clusterNode *node) {
                 req->has_write_handler = 0;
                 if (!req->owned_by_client)
                     req->client->requests_with_write_handler--;
-                addReplyError(req->client, err, req->id);
                 dequeueRequestToSend(req);
-                freeRequest(req);
+                if (!replyChildRequestError(req, err)) {
+                    addReplyError(req->client, err, req->id);
+                    freeRequest(req);
+                }
             }
         }
         /* If there are pending requests that are reading or waiting to read
@@ -3184,9 +3572,11 @@ void onClusterNodeDisconnection(clusterNode *node) {
             clientRequest *req = ln->value;
             if (req == NULL) continue;
             assert(req->node == node);
-            addReplyError(req->client, err, req->id);
             dequeuePendingRequest(req);
-            freeRequest(req);
+            if (!replyChildRequestError(req, err)) {
+                addReplyError(req->client, err, req->id);
+                freeRequest(req);
+            }
         }
         sdsfree(err);
     }
@@ -3297,7 +3687,7 @@ static int splitPipelinedQueries(clientRequest *req, char *p, int is_inline) {
     req->num_commands = 1;
     req->pending_bulks = 0;
     /* Create a new request with the remaining buffer */
-    clientRequest *new = createRequest(c);
+    clientRequest *new = createRequest(c, 0);
     new->buffer = sdscat(new->buffer, newbuf);
     sdsfree(newbuf);
     /* Set the new request as current in order to accept
@@ -3384,16 +3774,31 @@ static int parseRequest(clientRequest *req, sds *err) {
                 if (line != NULL) sdsfree(line);
                 line = sdsnewlen(p, len);
                 char *errptr = NULL;
-                lc = strtoll(line, &errptr, 10);
-                if (lc <= 0 || (errptr && errptr < (line + len))) {
+                lc = (len > 0 ? strtoll(line, &errptr, 10) : 0);
+                if (len <= 0 || errptr != (line + len) || lc > INT_MAX) {
                     if (err) {
                         *err = sdsnew("Protocol error: invalid multibulk "
                                       "length");
+                    }
+                    status = PARSE_STATUS_ERROR;
+                    goto cleanup;
+                }
+                req->query_offset += (len + 2);
+                if (lc <= 0) {
+                    /* Empty or null multibulk (eg. '*0' or '*-1'): Redis
+                     * silently ignores it, so just skip it and keep parsing
+                     * the remaining pipeline, if any. */
+                    req->pending_bulks = 0;
+                    req->current_bulk_length = REQ_STATUS_UNKNOWN;
+                    if (req->query_offset >= buflen) break;
+                    p = req->buffer + req->query_offset;
+                    if (*p != '*') {
+                        if (err) *err = sdsnew("Protocol error: expected '*'");
                         status = PARSE_STATUS_ERROR;
                         goto cleanup;
                     }
+                    continue;
                 }
-                req->query_offset += (len + 2);
                 req->pending_bulks = lc;
                 if (req->query_offset >= buflen) {
                     status = PARSE_STATUS_INCOMPLETE;
@@ -3433,8 +3838,8 @@ static int parseRequest(clientRequest *req, sds *err) {
                     if (line != NULL) sdsfree(line);
                     line = sdsnewlen(p, len);
                     char *errptr = NULL;
-                    arglen = strtoll(line, &errptr, 10);
-                    if (arglen <= 0 || (errptr && errptr < (line + len))) {
+                    arglen = (len > 0 ? strtoll(line, &errptr, 10) : -1);
+                    if (len <= 0 || errptr != (line + len) || arglen < 0) {
                         if (err) {
                             *err =
                                 sdsnew("Protocol error: invalid bulk length");
@@ -3600,6 +4005,13 @@ static sds getRequestCommand(clientRequest *req) {
 
 static int duplicateRequestForAllMasters(clientRequest *req) {
     int ok = 1, i;
+    if (req->duplicated) {
+        /* Already duplicated (eg. the request is being reprocessed after a
+         * cluster reconfiguration): just restore its target node. */
+        redisCluster *cluster = getCluster(req->client);
+        if (req->node == NULL) req->node = getFirstMappedNode(cluster);
+        return req->node != NULL;
+    }
     if (req->child_requests == NULL) {
         req->child_requests = listCreate();
         if (req->child_requests == NULL) return 0;
@@ -3620,7 +4032,7 @@ static int duplicateRequestForAllMasters(clientRequest *req) {
         if (node->is_replica) continue;
         if (req->node == NULL) req->node = node;
         else {
-            clientRequest *child = createRequest(req->client);
+            clientRequest *child = createRequest(req->client, 1);
             ok = (child != NULL);
             if (!ok) break;
             child->parent_request = req;
@@ -3637,11 +4049,10 @@ static int duplicateRequestForAllMasters(clientRequest *req) {
             child->command = req->command;
             child->parsing_status = req->parsing_status;
             listAddNodeHead(req->child_requests, child);
-            if (child->id > req->max_child_reply_id)
-                req->max_child_reply_id = child->id;
         }
     }
     req->client->current_request = cur;
+    if (ok) req->duplicated = 1;
     return ok;
 }
 
@@ -3705,7 +4116,7 @@ static int splitMultiSlotRequest(clientRequest *req, int idx) {
     /* Trim the original buffer from offset to end to create a new request. */
     sdsrange(oldbuf, offset, -1);
     clientRequest *cur = req->client->current_request;
-    new = createRequest(req->client);
+    new = createRequest(req->client, 1);
     success = (new != NULL);
     if (!success) goto cleanup;
     req->client->current_request = cur;
@@ -3739,8 +4150,6 @@ static int splitMultiSlotRequest(clientRequest *req, int idx) {
         goto cleanup;
     }
     listAddNodeHead(parent->child_requests, new);
-    if (new->id > parent->max_child_reply_id)
-        parent->max_child_reply_id = new->id;
     proxyLogDebug("Added child request " REQID_PRINTF_FMT
                   " to parent " REQID_PRINTF_FMT,
                   REQID_PRINTF_ARG(new), REQID_PRINTF_ARG(parent));
@@ -3768,12 +4177,27 @@ cleanup:
 
 static clusterNode *getRequestNode(clientRequest *req, sds *err) {
     clusterNode *node = NULL;
+    if (req->force_node && req->node != NULL) return req->node;
     if (req->node && req->command == scanCommandDef) return req->node;
     int first_key = req->command->first_key,
         last_key = req->command->last_key,
         key_step = req->command->key_step, i;
     redisCluster *cluster = getCluster(req->client);
     int slot = UNDEFINED_SLOT, last_slot = UNDEFINED_SLOT, no_args = 0;
+    /* A child of a broadcast command must not be duplicated again: route it
+     * to the first master node (its parent already owns the broadcast). */
+    if (req->parent_request != NULL &&
+        (req->command->proxy_flags & CMDFLAG_DUPLICATE))
+    {
+        req->node = getFirstMappedNode(cluster);
+        return req->node;
+    }
+    /* Commands flagged with CMDFLAG_FIRST_MASTER have no keys and must be
+     * executed on the first master node, regardless of their arguments. */
+    if (req->command->proxy_flags & CMDFLAG_FIRST_MASTER) {
+        req->node = getFirstMappedNode(cluster);
+        return req->node;
+    }
     if (req->argc == 1) {
         if (req->client->multi_transaction) {
             if (req->client->multi_transaction_node != NULL)
@@ -3830,7 +4254,12 @@ static clusterNode *getRequestNode(clientRequest *req, sds *err) {
     }
     if (last_key >= req->argc) last_key = req->argc - 1;
     if (last_key < 0) last_key = req->argc + last_key;
-    if (last_key < first_key) last_key = first_key;
+    if (last_key < first_key) {
+        /* The command has no keys (eg. EVAL with numkeys=0 but with some
+         * ARGV arguments): route it to the first master node. */
+        req->node = getFirstMappedNode(cluster);
+        return req->node;
+    }
     if (key_step < 1) key_step = 1;
     int skipped_count = 0;
     for (i = first_key; i <= last_key; i += key_step) {
@@ -3853,9 +4282,7 @@ static clusterNode *getRequestNode(clientRequest *req, sds *err) {
                     errmsg = "Cross-slot queries are disabled. They can be "
                              "enabled by using the --enable-cross-slot option,"
                              " or by calling "
-                             "`PROXY CONFIG SET enable-cross-slot 1`. "
-                             "WARN: cross-slot queries can break the atomicity"
-                             " of the query itself.";
+                             "`PROXY CONFIG SET enable-cross-slot 1`.";
                 } else if (req->command->proxy_flags &
                            CMDFLAG_MULTISLOT_UNSUPPORTED ||
                            req->command->handleReply == NULL)
@@ -4017,7 +4444,7 @@ static void dequeueRequest(clientRequest *req, int queue_type) {
     }
 }
 
-static clientRequest *createRequest(client *c) {
+static clientRequest *createRequest(client *c, int is_child) {
     clientRequest *req = zcalloc(sizeof(*req));
     if (req == NULL) goto alloc_failure;
     int added = 0;
@@ -4045,21 +4472,32 @@ static clientRequest *createRequest(client *c) {
     req->node = NULL;
     req->slot = UNDEFINED_SLOT;
     c->current_request = req;
-    req->id = c->next_request_id++;
-    /* Avoid overflow */
-    /* TODO: this could lead to issues in reply sequencing */
-    if (c->next_request_id >= UINT64_MAX)
-        c->next_request_id = 0;
+    if (is_child) {
+        /* Child requests use a separate ID space: see
+         * CHILD_REQUEST_ID_BASE. */
+        req->id = CHILD_REQUEST_ID_BASE | c->next_child_request_id++;
+        if (c->next_child_request_id >= CHILD_REQUEST_ID_BASE)
+            c->next_child_request_id = 0;
+    } else {
+        req->id = c->next_request_id++;
+        /* Avoid overflow */
+        /* TODO: this could lead to issues in reply sequencing */
+        if (c->next_request_id >= UINT64_MAX)
+            c->next_request_id = 0;
+    }
     req->need_reprocessing = 0;
     req->parsed = 0;
     req->owned_by_client = (c->cluster != NULL);
     req->closes_transaction = 0;
+    req->asking = 0;
+    req->ask_retries = 0;
+    req->force_node = 0;
+    req->duplicated = 0;
     req->parent_request = NULL;
     req->child_requests = NULL;
     req->child_replies = NULL;
     req->requests_pending_lnode = NULL;
     req->requests_to_send_lnode = NULL;
-    req->max_child_reply_id = req->id;
     proxyLogDebug("Created Request " REQID_PRINTF_FMT  " with address %p",
                   REQID_PRINTF_ARG(req), (void *)req);
     return req;
@@ -4126,13 +4564,14 @@ static int sendRequestToCluster(clientRequest *req, sds *errmsg)
         if ((ctx = clusterNodeConnect(req->node)) == NULL) {
             sds err = sdsnew("Could not connect to node ");
             err = sdscatfmt(err, "%s:%u", req->node->ip, req->node->port);
-            addReplyError(req->client, err, req->id);
+            int child_replied = replyChildRequestError(req, err);
+            if (!child_replied) addReplyError(req->client, err, req->id);
             proxyLogDebug("%s", err);
             if (errmsg != NULL) {
                 /* Remember to free the string outside this function*/
                 *errmsg = err;
             } else sdsfree(err);
-            freeRequest(req);
+            if (!child_replied) freeRequest(req);
             return 0;
         }
         /* Install the write handler since the connection to the cluster node
@@ -4140,10 +4579,12 @@ static int sendRequestToCluster(clientRequest *req, sds *errmsg)
         if (!installIOHandler(el, ctx->fd, AE_WRITABLE, writeToClusterHandler,
                               req->node->connection, 0))
         {
-            addReplyError(req->client, ERROR_CLUSTER_WRITE_FAIL, req->id);
             proxyLogErr("Failed to create write handler for request "
                 REQID_PRINTF_FMT, REQID_PRINTF_ARG(req));
-            freeRequest(req);
+            if (!replyChildRequestError(req, ERROR_CLUSTER_WRITE_FAIL)) {
+                addReplyError(req->client, ERROR_CLUSTER_WRITE_FAIL, req->id);
+                freeRequest(req);
+            }
             return 0;
         }
         req->has_write_handler = 1;
@@ -4164,9 +4605,11 @@ static int sendRequestToCluster(clientRequest *req, sds *errmsg)
         {
             proxyLogErr("Failed to create read reply handler for node %s:%d",
                           req->node->ip, req->node->port);
-            addReplyError(req->client, ERROR_CLUSTER_READ_FAIL,
-                          req->id);
-            freeRequest(req);
+            if (!replyChildRequestError(req, ERROR_CLUSTER_READ_FAIL)) {
+                addReplyError(req->client, ERROR_CLUSTER_READ_FAIL,
+                              req->id);
+                freeRequest(req);
+            }
             return 0;
         } else  {
             conn->has_read_handler = 1;
@@ -4260,19 +4703,31 @@ int processRequest(clientRequest *req, int *parsing_status,
     }
     if (next != NULL && req->requests_lnode != NULL) {
         listNode *next_node = listNextNode(req->requests_lnode);
+        /* Child requests (created by multiple-replies or cross-slot commands)
+         * are internal: they are enqueued by their parent and must never be
+         * processed again as client requests. */
+        while (next_node != NULL) {
+            clientRequest *next_req = next_node->value;
+            if (next_req == NULL || next_req->parent_request == NULL) break;
+            next_node = listNextNode(next_node);
+        }
         if (next_node == NULL) *next = NULL;
         else *next = next_node->value;
     }
     if (req == c->current_request) c->current_request = NULL;
-    if (req->id < c->min_reply_id) c->min_reply_id = req->id;
+    if (req->parent_request == NULL && req->id < c->min_reply_id)
+        c->min_reply_id = req->id;
     sds command_name = NULL;
     sds errmsg = NULL;
     proxyLogDebug("Processing request " REQID_PRINTF_FMT,
                   REQID_PRINTF_ARG(req));
     if (req->argc == 0) {
-        proxyLogDebug("Request with zero arguments");
-        errmsg = sdsnew("Invalid request");
-        goto invalid_request;
+        /* Empty multibulk queries ('*0' or '*-1') are silently ignored by
+         * Redis: reply with an empty buffer (to keep the reply sequence in
+         * sync) and free the request. */
+        addReplyRaw(c, "", 0, req->id);
+        freeRequest(req);
+        return 1;
     }
     command_name = getRequestCommand(req);
     if (command_name == NULL) {
@@ -4298,9 +4753,15 @@ int processRequest(clientRequest *req, int *parsing_status,
         goto invalid_request;
     }
     req->command = cmd;
-    if (cmd->handle && cmd->handle(req) == PROXY_COMMAND_HANDLED) {
-        if (command_name) sdsfree(command_name);
-        return 1;
+    if (cmd->handle) {
+        int handled = cmd->handle(req);
+        if (handled == PROXY_COMMAND_HANDLED) {
+            if (command_name) sdsfree(command_name);
+            /* Some handled commands (eg. MULTI) take ownership of the request
+             * and keep it alive: in that case do not free it here. */
+            if (req != c->multi_request) freeRequest(req);
+            return 1;
+        }
     }
     redisCluster *cluster = getCluster(c);
     assert(cluster != NULL);
@@ -4366,6 +4827,17 @@ int processRequest(clientRequest *req, int *parsing_status,
         clusterNode *last_node = req->node;
         while ((ln = listNext(&li))) {
             clientRequest *r = ln->value;
+            /* Children of a reprocessed request may have lost their target
+             * node (the old cluster configuration has been freed): route
+             * them again before enqueuing. */
+            if (r->node == NULL) {
+                sds child_err = NULL;
+                if (getRequestNode(r, &child_err) == NULL) {
+                    if (child_err != NULL) sdsfree(child_err);
+                    goto invalid_request;
+                }
+                if (child_err != NULL) sdsfree(child_err);
+            }
             if (!enqueueRequestToSend(r)) goto invalid_request;
             clientRequest *next_req = getFirstRequestToSend(r->node, NULL);
             if (r->node != last_node || next_req == r) {
@@ -4381,6 +4853,10 @@ int processRequest(clientRequest *req, int *parsing_status,
 invalid_request:
     if (command_name) sdsfree(command_name);
     if (errmsg != NULL) {
+        if (req != NULL && replyChildRequestError(req, errmsg)) {
+            sdsfree(errmsg);
+            return 1;
+        }
         addReplyError(c, (char *) errmsg, req_id);
         sdsfree(errmsg);
         if (req) freeRequest(req);
@@ -4400,7 +4876,7 @@ void readQuery(aeEventLoop *el, int fd, void *privdata, int mask){
     int nread, readlen = (1024*16);
     clientRequest *req = c->current_request;
     if (req == NULL) {
-        req = createRequest(c);
+        req = createRequest(c, 0);
         if (req == NULL) {
             proxyLogErr("Failed to create request");
             freeClient(c);
@@ -4557,6 +5033,62 @@ static int addChildRequestReply(clientRequest *req, char *replybuf, int len) {
     return completed;
 }
 
+/* Handle an '-ASK <slot> <host>:<port>' reply. Unlike MOVED, ASK does not
+ * require a cluster reconfiguration, since the slot is being migrated: the
+ * request is re-sent to the indicated node, prefixed with the ASKING command.
+ * Return 1 if the request has been re-queued, 0 if it could not be handled
+ * (in which case the caller should fall back to a cluster reconfiguration). */
+static int handleAskReply(clientRequest *req, const char *errstr) {
+    const char *p = errstr + 3; /* Skip "ASK" */
+    char *endptr = NULL;
+    while (*p == ' ') p++;
+    strtol(p, &endptr, 10); /* slot: not needed to route the request */
+    if (endptr == p) return 0;
+    while (*endptr == ' ') endptr++;
+    if (*endptr == '\0') return 0;
+    sds addr = sdsnew(endptr);
+    char *sep = strrchr(addr, ':');
+    if (sep == NULL) {
+        sdsfree(addr);
+        return 0;
+    }
+    *sep = '\0';
+    int port = atoi(sep + 1);
+    redisCluster *cluster = getCluster(req->client);
+    clusterNode *node = getNodeByAddress(cluster, addr, port);
+    sdsfree(addr);
+    if (node == NULL) return 0;
+    if (req->ask_retries >= MAX_ASK_RETRIES) return 0;
+    req->ask_retries++;
+    clusterNode *old_node = req->node;
+    size_t old_written = req->written;
+    req->node = node;
+    req->written = 0;
+    if (!enqueueRequestToSend(req)) {
+        req->node = old_node;
+        req->written = old_written;
+        return 0;
+    }
+    if (!req->asking) {
+        /* Prepend the ASKING command to the query and shift the arguments'
+         * offsets, so that the request can still be routed again (eg. in case
+         * a subsequent MOVED reply triggers a reconfiguration). */
+        int i;
+        sds asking = sdsnew("*1\r\n$6\r\nASKING\r\n");
+        int delta = sdslen(asking);
+        asking = sdscatsds(asking, req->buffer);
+        sdsfree(req->buffer);
+        req->buffer = asking;
+        for (i = 0; i < req->argc && i < req->offsets_size; i++)
+            req->offsets[i] += delta;
+        req->asking = 1;
+    }
+    proxyLogDebug("ASK: re-sending request " REQID_PRINTF_FMT " to %s:%d",
+                  REQID_PRINTF_ARG(req), node->ip, node->port);
+    handleNextRequestsToCluster(node, NULL);
+    return 1;
+}
+
 static int processClusterReplyBuffer(redisContext *ctx, clusterNode *node,
                                      int thread_id)
 {
@@ -4604,6 +5136,24 @@ static int processClusterReplyBuffer(redisContext *ctx, clusterNode *node,
             /* TODO: if (errmsg != NULL) ; */
             dequeuePendingRequest(req);
             goto consume_buffer;
+        } else if (req->asking && ok && reply != NULL) {
+            /* The request has been re-sent with an ASKING prefix (see
+             * `handleAskReply`), so the first reply received is the response
+             * to ASKING: discard it and restore the original query, in case
+             * the request will have to be re-sent again (eg. on MOVED). */
+            const char *asking_cmd = "*1\r\n$6\r\nASKING\r\n";
+            int asking_len = strlen(asking_cmd), i;
+            if (sdslen(req->buffer) >= (size_t) asking_len &&
+                memcmp(req->buffer, asking_cmd, asking_len) == 0)
+            {
+                sdsrange(req->buffer, asking_len, -1);
+                for (i = 0; i < req->argc && i < req->offsets_size; i++)
+                    req->offsets[i] -= asking_len;
+            }
+            req->asking = 0;
+            req = NULL;
+            free_req = 0;
+            goto consume_buffer;
         }
         proxyLogDebug("Reply read complete for request " REQID_PRINTF_FMT
                       ", %s%s", REQID_PRINTF_ARG(req),
@@ -4612,16 +5162,24 @@ static int processClusterReplyBuffer(redisContext *ctx, clusterNode *node,
         dequeuePendingRequest(req);
         cluster = getCluster(req->client);
         assert(cluster != NULL);
-        if (reply->type == REDIS_REPLY_ERROR) {
-            assert(reply->str != NULL);
+        if (ok && reply != NULL && reply->type == REDIS_REPLY_ERROR &&
+            reply->str != NULL)
+        {
+            int is_moved = (strstr(reply->str, "MOVED") == reply->str);
+            int is_ask = (strstr(reply->str, "ASK") == reply->str);
+            if (is_ask && handleAskReply(req, reply->str)) {
+                /* The request has been re-queued to the ASK target node. */
+                req = NULL;
+                free_req = 0;
+                goto consume_buffer;
+            }
             /* In case of ASK|MOVED reply the cluster need to be
              * reconfigured.
              * In this case we suddenly set `cluster->is_updating` and
              * we add the request to the clusters' `requests_to_reprocess`
              * pool (the request will be also added to a
              * `requests_to_reprocess` list on the client). */
-            if ((strstr(reply->str, "ASK") == reply->str ||
-                strstr(reply->str, "MOVED") == reply->str))
+            if (is_ask || is_moved)
             {
                 proxyLogDebug("Cluster configuration changed! "
                               "(request " REQID_PRINTF_FMT ")",
@@ -4640,8 +5198,14 @@ static int processClusterReplyBuffer(redisContext *ctx, clusterNode *node,
                 }
             }
         }
-        if (errmsg != NULL) addReplyError(req->client, errmsg, req->id);
-        else {
+        if (errmsg != NULL) {
+            if (replyChildRequestError(req, errmsg)) {
+                req = NULL;
+                free_req = 0;
+                goto consume_buffer;
+            }
+            addReplyError(req->client, errmsg, req->id);
+        } else {
             char *obuf = ctx->reader->buf;
             /*size_t len = ctx->reader->len;*/
             size_t len = ctx->reader->pos;
@@ -4704,9 +5268,13 @@ consume_buffer:
                     proxyLogErr("Cluster reconfiguration failed! (thread %d)",
                                 thread_id);
                     if (req) {
-                        addReplyError(req->client,
-                                      ERROR_CLUSTER_RECONFIG,
-                                      req->id);
+                        if (replyChildRequestError(req,
+                                                   ERROR_CLUSTER_RECONFIG))
+                            req = NULL;
+                        else
+                            addReplyError(req->client,
+                                          ERROR_CLUSTER_RECONFIG,
+                                          req->id);
                     }
                     do_break = 1;
                 }
@@ -5023,15 +5591,79 @@ cleanup:
     return exit_status;
 }
 
-int getInfoReply(void *_reply, void *_req, char *buf, int len) {
-    UNUSED(_reply);
-    UNUSED(buf);
-    UNUSED(len);
+static sds extractBulkPayload(sds reply) {
+    if (reply == NULL || sdslen(reply) == 0 || reply[0] != '$') return NULL;
+    char *cr = strstr(reply, "\r\n");
+    if (cr == NULL) return NULL;
+    long len = strtol(reply + 1, NULL, 10);
+    if (len < 0) return NULL;
+    char *payload = cr + 2;
+    if ((size_t)(payload - reply) + (size_t) len > sdslen(reply)) return NULL;
+    return sdsnewlen(payload, (size_t) len);
+}
 
+int getInfoReply(void *_reply, void *_req, char *buf, int len) {
     clientRequest *req = _req;
-    char *message = "# Server\nredis_version:4.0.10\nredis_git_sha1:0\nredis_git_dirty:0\nredis_build_id:0\nredis_mode:standalone\nos:CentOS\narch_bits:64\nmultiplexing_api:epoll\natomicvar_api:atomic-builtin\ngcc_version:0.0.0\nprocess_id:1\ntcp_port:6379\nuptime_in_seconds:402830\nuptime_in_days:4\nhz:10\nlru_clock:7318731\nexecutable:-\nconfig_file:-\n\n# Clients\nconnected_clients:1\nclient_longest_output_list:0\nclient_biggest_input_buf:0\nblocked_clients:0\n\n# Memory\nused_memory:252333560\nused_memory_human:240.64M\nused_memory_rss:266489856\nused_memory_rss_human:254.14M\nused_memory_peak:252580112\nused_memory_peak_human:240.88M\nused_memory_peak_perc:99.90%\nused_memory_overhead:74868676\nused_memory_startup:3662184\nused_memory_dataset:177464884\nused_memory_dataset_perc:71.37%\nused_memory_lua:37888\nused_memory_lua_human:37.00K\nmaxmemory:2488396677\nmaxmemory_human:2.32G\nmaxmemory_policy:volatile-lru\nmem_fragmentation_ratio:1.06\nmem_allocator:jemalloc-4.0.3\nactive_defrag_running:0\nlazyfree_pending_objects:0\n\n# Persistence\nloading:0\nrdb_changes_since_last_save:0\nrdb_bgsave_in_progress:0\nrdb_last_save_time:1634542839\nrdb_last_bgsave_status:ok\nrdb_last_bgsave_time_sec:3\nrdb_current_bgsave_time_sec:-1\nrdb_last_cow_size:692224\naof_enabled:0\naof_rewrite_in_progress:0\naof_rewrite_scheduled:0\naof_last_rewrite_time_sec:-1\naof_current_rewrite_time_sec:-1\naof_last_bgrewrite_status:ok\naof_last_write_status:ok\naof_last_cow_size:0\n\n# Stats\ntotal_connections_received:13484\ntotal_commands_processed:2635950\ninstantaneous_ops_per_sec:3\ntotal_net_input_bytes:266117933\ntotal_net_output_bytes:3310089854\ninstantaneous_input_kbps:0.08\ninstantaneous_output_kbps:5.78\nrejected_connections:0\nsync_full:0\nsync_partial_ok:0\nsync_partial_err:1\nexpired_keys:0\nexpired_stale_perc:0.00\nexpired_time_cap_reached_count:0\nevicted_keys:0\nkeyspace_hits:0\nkeyspace_misses:4\npubsub_channels:0\npubsub_patterns:0\nlatest_fork_usec:3209\nmigrate_cached_sockets:0\nactive_defrag_hits:0\nactive_defrag_misses:0\nactive_defrag_key_hits:0\nactive_defrag_key_misses:0\n\n# Replication\nrole:master\nconnected_slaves:0\n\n# CPU\nused_cpu_sys:206.76\nused_cpu_user:149.90\nused_cpu_sys_children:0.64\nused_cpu_user_children:9.47\n\n# SSL\nssl_enabled:no\nssl_connections_to_previous_certificate:0\nssl_connections_to_current_certificate:0\nssl_current_certificate_not_before_date:(null)\nssl_current_certificate_not_after_date:(null)\nssl_current_certificate_serial:0\n\n# Cluster\ncluster_enabled:0\n\n# Keyspace\ndb0:keys=0,expires=0,avg_ttl=0\n";
-    // printf("%s",message);
-    addReplyString(req->client, message, req->id);
-    req->client->min_reply_id = req->max_child_reply_id + 1;
+    client *c = req->client;
+    /* When this handler is called by `addChildRequestReply` (multiple replies
+     * mode), `_reply`, `buf` and `len` are all empty and the replies are in
+     * `req->child_replies`. */
+    int from_children = (_reply == NULL && buf == NULL && len == 0);
+    sds payload = NULL, error = NULL;
+    if (!from_children) {
+        sds raw = sdsnewlen(buf, len);
+        if (sdslen(raw) > 0 && raw[0] == '-') error = raw;
+        else {
+            payload = extractBulkPayload(raw);
+            sdsfree(raw);
+        }
+    } else {
+        raxIterator iter;
+        raxStart(&iter, req->child_replies);
+        if (raxSeek(&iter, "^", NULL, 0)) {
+            while (raxNext(&iter)) {
+                sds child_reply = (sds) iter.data;
+                if (child_reply == NULL || sdslen(child_reply) == 0) continue;
+                if (child_reply[0] == '-') {
+                    if (error == NULL) error = sdsdup(child_reply);
+                    continue;
+                }
+                if (payload == NULL) payload = extractBulkPayload(child_reply);
+                if (payload != NULL) break;
+            }
+        }
+        raxStop(&iter);
+    }
+    if (error != NULL) {
+        addReplyRaw(c, error, sdslen(error), req->id);
+        sdsfree(error);
+    } else if (payload == NULL) {
+        addReplyError(c, ERROR_INVALID_REPLY, req->id);
+    } else {
+        /* Append the proxy's own sections unless a specific section has been
+         * requested. */
+        int append_proxy = 1;
+        if (req->argc > 1) {
+            sds section = requestArg(req, 1);
+            if (section != NULL && strcasecmp(section, "default") != 0 &&
+                strcasecmp(section, "all") != 0 &&
+                strcasecmp(section, "everything") != 0)
+            {
+                append_proxy = 0;
+            }
+            if (section != NULL) sdsfree(section);
+        }
+        if (append_proxy) {
+            redisCluster *cluster = getCluster(c);
+            sds proxy_info = genInfoString(NULL, cluster);
+            if (sdslen(payload) > 0 && sdslen(proxy_info) > 0)
+                payload = sdscat(payload, "\r\n");
+            payload = sdscatsds(payload, proxy_info);
+            sdsfree(proxy_info);
+        }
+        addReplyBulkStringLen(c, payload, sdslen(payload), req->id);
+        sdsfree(payload);
+    }
+    if (!from_children) freeRequest(req);
     return 1;
 }

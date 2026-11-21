@@ -143,6 +143,15 @@ void addReplyErrorWrongArgc(client *c, const char *cmdname, uint64_t req_id) {
 }
 
 void addReplyRaw(client *c, const char *buf, size_t len, uint64_t req_id) {
+    /* Child requests (requests created to handle multiple replies or
+     * cross-slot queries) must never reply to the client directly, since their
+     * IDs are not part of the client reply sequence: their replies are
+     * collected by the parent request instead. */
+    if (req_id >= CHILD_REQUEST_ID_BASE) {
+        proxyLogDebug("WARN: dropping reply for child request %llu",
+                      (unsigned long long) req_id);
+        return;
+    }
     /* If the smallest request ID written is smaller than reply's request ID,
      *  replies are not ordered, so add the reply to the unordered_replies rax
      * using the request ID as the key. */

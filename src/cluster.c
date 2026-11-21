@@ -736,6 +736,19 @@ clusterNode *getNodeByKey(redisCluster *cluster, char *key, int keylen,
     return node;
 }
 
+clusterNode *getNodeByAddress(redisCluster *cluster, const char *ip, int port) {
+    if (cluster == NULL || ip == NULL) return NULL;
+    listIter li;
+    listNode *ln;
+    listRewind(cluster->nodes, &li);
+    while ((ln = listNext(&li))) {
+        clusterNode *node = ln->value;
+        if (node == NULL || node->ip == NULL) continue;
+        if (node->port == port && strcmp(node->ip, ip) == 0) return node;
+    }
+    return NULL;
+}
+
 clusterNode *getNodeByName(redisCluster *cluster, const char *name) {
     if (cluster->nodes_by_name == NULL) return NULL;
     clusterNode *node = NULL;
@@ -901,6 +914,11 @@ int updateCluster(redisCluster *cluster) {
     while (raxNext(&iter)) {
         clientRequest *req = (clientRequest *) iter.data;
         req->need_reprocessing = 0;
+        /* Nodes of the old configuration are going to be freed: clear the
+         * request's target node (and any forced routing) so that it will be
+         * routed again on the new configuration. */
+        req->node = NULL;
+        req->force_node = 0;
         if (raxRemove(cluster->requests_to_reprocess, iter.key, iter.key_len,
              NULL)) raxSeek(&iter,">",iter.key,iter.key_len);
         listNode *ln = listSearchKey(req->client->requests_to_reprocess, req);
