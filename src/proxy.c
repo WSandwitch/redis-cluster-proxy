@@ -867,10 +867,6 @@ static int prefixRequestKeys(clientRequest *req, sds *err) {
             if (skip != NULL) zfree(skip);
             return 0;
         }
-        if (numkeys == 0) {
-            if (skip != NULL) zfree(skip);
-            return 1;
-        }
     }
     if (first_key < 1) {
         if (skip != NULL) zfree(skip);
@@ -1059,6 +1055,513 @@ static void addReplyWithStrippedKeys(clientRequest *req, const char *buf,
         addReplyRaw(req->client, stripped, sdslen(stripped), req->id);
         sdsfree(stripped);
     } else addReplyRaw(req->client, buf, len, req->id);
+}
+
+/* -----------------------------------------------------------------------------
+ * Database-wide commands (DBSIZE, FLUSHDB, MOVE, COPY, SWAPDB, SORT)
+ * -------------------------------------------------------------------------- */
+
+#define DB_SCAN_STATE_SCAN      1
+#define DB_SCAN_STATE_UNLINK    2
+
+/* Return the master node with the given index in the alphabetically sorted
+ * list of master names, or NULL if the index is out of range. */
+static clusterNode *dbMasterNodeByIndex(clientRequest *req, int idx) {
+    redisCluster *cluster = getCluster(req->client);
+    list *names = clusterGetMasterNames(cluster);
+    if (names == NULL || idx < 0 || idx >= (int) listLength(names))
+        return NULL;
+    listNode *ln = listIndex(names, (long) idx);
+    if (ln == NULL) return NULL;
+    sds name = listNodeValue(ln);
+    if (name == NULL) return NULL;
+    return getNodeByName(cluster, name);
+}
+
+/* Prepare a SCAN query for the database of `req`, targeting the current node
+ * and cursor (see db_scan_node/db_scan_cursor). */
+static int dbScanPrepare(clientRequest *req) {
+    clusterNode *node = dbMasterNodeByIndex(req, req->db_scan_node);
+    if (node == NULL) return 0;
+    sds *args = zcalloc(sizeof(sds) * 6);
+    if (args == NULL) return 0;
+    args[0] = sdsnew("SCAN");
+    args[1] = sdscatprintf(sdsempty(), "%llu",
+                           (unsigned long long) req->db_scan_cursor);
+    args[2] = sdsnew("COUNT");
+    args[3] = sdscatprintf(sdsempty(), "%d", config.db_scan_count);
+    args[4] = sdsnew("MATCH");
+    args[5] = dbKeyPattern(req->db, "*", 1);
+    int ok = (args[0] && args[1] && args[2] && args[3] && args[4] && args[5]);
+    if (ok) ok = requestSetArgs(req, args, 6);
+    freeRequestArgs(args, 6);
+    if (!ok) return 0;
+    req->node = node;
+    req->force_node = 1;
+    req->written = 0;
+    return 1;
+}
+
+/* Prepare a UNLINK/DEL batch for the given physical keys.
+ *
+ * Keys returned by a SCAN batch can belong to different slots, so they cannot
+ * be removed with a single multi-key UNLINK/DEL (Redis Clusters reply with
+ * CROSSSLOT). They are passed as ARGV of a Lua script instead: all the keys
+ * already live on the target node and the script removes them one by one. */
+static int dbUnlinkPrepare(clientRequest *req, sds *keys, int nkeys) {
+    static const char *del_script =
+        "local n = 0\n"
+        "for i = 1, #ARGV do n = n + redis.call('DEL', ARGV[i]) end\n"
+        "return n";
+    static const char *unlink_script =
+        "local n = 0\n"
+        "for i = 1, #ARGV do n = n + redis.call('UNLINK', ARGV[i]) end\n"
+        "return n";
+    sds *args = zcalloc(sizeof(sds) * (nkeys + 3));
+    if (args == NULL) return 0;
+    args[0] = sdsnew("EVAL");
+    args[1] = sdsnew(req->db_scan_async ? unlink_script : del_script);
+    args[2] = sdsnew("0");
+    int i, ok = (args[0] && args[1] && args[2]);
+    for (i = 0; ok && i < nkeys; i++) {
+        args[i + 3] = sdsdup(keys[i]);
+        if (args[i + 3] == NULL) ok = 0;
+    }
+    if (ok) ok = requestSetArgs(req, args, nkeys + 3);
+    freeRequestArgs(args, nkeys + 3);
+    if (!ok) return 0;
+    req->keys_prefixed = 1;
+    req->written = 0;
+    return 1;
+}
+
+/* (Re-)enqueue the request to its target node. */
+static int dbScanEnqueue(clientRequest *req) {
+    if (!enqueueRequestToSend(req)) return 0;
+    handleNextRequestsToCluster(req->node, NULL);
+    return 1;
+}
+
+/* Parse a SCAN reply. If `keys` is not NULL, store the returned keys in a
+ * newly allocated array of sds (to be freed by the caller). */
+static int dbScanParseReply(const char *buf, size_t len, uint64_t *cursor,
+                            sds **keys, int *nkeys) {
+    int i, ok = 0;
+    sds *out = NULL;
+    long n;
+    const char *nl;
+    size_t pos, data, p;
+    long clen, klen;
+    *cursor = 0;
+    if (keys != NULL) *keys = NULL;
+    *nkeys = 0;
+    if (buf == NULL || len == 0 || buf[0] != '*') return 0;
+    nl = memchr(buf, '\n', len);
+    if (nl == NULL) return 0;
+    pos = (size_t) (nl - buf) + 1;
+    if (pos >= len || buf[pos] != '$') return 0;
+    nl = memchr(buf + pos, '\n', len - pos);
+    if (nl == NULL) return 0;
+    clen = strtol(buf + pos + 1, NULL, 10);
+    data = (size_t) (nl - buf) + 1;
+    if (clen < 0 || data + (size_t) clen + 2 > len) return 0;
+    {
+        sds cursor_s = sdsnewlen(buf + data, (size_t) clen);
+        if (cursor_s == NULL) return 0;
+        *cursor = strtoull(cursor_s, NULL, 10);
+        sdsfree(cursor_s);
+    }
+    p = data + (size_t) clen + 2;
+    if (p >= len || buf[p] != '*') return 0;
+    nl = memchr(buf + p, '\n', len - p);
+    if (nl == NULL) return 0;
+    n = strtol(buf + p + 1, NULL, 10);
+    p = (size_t) (nl - buf) + 1;
+    if (n < 0) n = 0;
+    if (keys != NULL) {
+        out = zmalloc(sizeof(sds) * (n > 0 ? n : 1));
+        if (out == NULL) return 0;
+    }
+    for (i = 0; i < n; i++) {
+        if (p >= len || buf[p] != '$') goto cleanup;
+        nl = memchr(buf + p, '\n', len - p);
+        if (nl == NULL) goto cleanup;
+        klen = strtol(buf + p + 1, NULL, 10);
+        data = (size_t) (nl - buf) + 1;
+        if (klen < 0 || data + (size_t) klen + 2 > len) goto cleanup;
+        if (out != NULL) {
+            out[i] = sdsnewlen(buf + data, (size_t) klen);
+            if (out[i] == NULL) goto cleanup;
+        }
+        p = data + (size_t) klen + 2;
+    }
+    *nkeys = (int) n;
+    if (keys != NULL) *keys = out;
+    ok = 1;
+cleanup:
+    if (!ok) {
+        int j;
+        if (out != NULL) {
+            for (j = 0; j < i && j < n; j++)
+                if (out[j] != NULL) sdsfree(out[j]);
+            zfree(out);
+        }
+        if (keys != NULL) *keys = NULL;
+        *nkeys = 0;
+    }
+    return ok;
+}
+
+int dbsizeCommand(void *r) {
+    clientRequest *req = r;
+    if (!dbEmulationEnabled()) return PROXY_COMMAND_UNHANDLED;
+    if (req->client->multi_transaction) {
+        addReplyError(req->client, "DBSIZE is not supported inside MULTI when "
+                      "database emulation is enabled", req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    req->db_scan_state = DB_SCAN_STATE_SCAN;
+    req->db_scan_node = 0;
+    req->db_scan_cursor = 0;
+    req->db_scan_total = 0;
+    if (!dbScanPrepare(req)) {
+        addReplyError(req->client, ERROR_OOM, req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    return PROXY_COMMAND_UNHANDLED;
+}
+
+int dbsizeReply(void *_reply, void *_req, char *buf, int len) {
+    if (!dbEmulationEnabled()) return sumReplies(_reply, _req, buf, len);
+    clientRequest *req = _req;
+    uint64_t cursor = 0;
+    int nkeys = 0;
+    if (!dbScanParseReply(buf, len, &cursor, NULL, &nkeys)) {
+        addReplyError(req->client, ERROR_INVALID_REPLY, req->id);
+        return 1;
+    }
+    req->db_scan_total += nkeys;
+    if (cursor != 0) {
+        req->db_scan_cursor = cursor;
+        if (!dbScanPrepare(req) || !dbScanEnqueue(req)) {
+            addReplyError(req->client, ERROR_OOM, req->id);
+        }
+        return 1;
+    }
+    req->db_scan_node++;
+    req->db_scan_cursor = 0;
+    if (dbMasterNodeByIndex(req, req->db_scan_node) != NULL) {
+        if (!dbScanPrepare(req) || !dbScanEnqueue(req)) {
+            addReplyError(req->client, ERROR_OOM, req->id);
+        }
+        return 1;
+    }
+    addReplyInt(req->client, req->db_scan_total, req->id);
+    return 1;
+}
+
+int flushdbCommand(void *r) {
+    clientRequest *req = r;
+    if (!dbEmulationEnabled()) return PROXY_COMMAND_UNHANDLED;
+    if (req->client->multi_transaction) {
+        addReplyError(req->client, "FLUSHDB is not supported inside MULTI "
+                      "when database emulation is enabled", req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    int async = 0, i;
+    for (i = 1; i < req->argc; i++) {
+        sds arg = requestArg(req, i);
+        if (arg == NULL) break;
+        if (!strcasecmp(arg, "async")) async = 1;
+        else if (!strcasecmp(arg, "sync")) async = 0;
+        else {
+            sdsfree(arg);
+            addReplyError(req->client, "syntax error", req->id);
+            return PROXY_COMMAND_HANDLED;
+        }
+        sdsfree(arg);
+    }
+    req->db_scan_async = async;
+    req->db_scan_state = DB_SCAN_STATE_SCAN;
+    req->db_scan_node = 0;
+    req->db_scan_cursor = 0;
+    req->db_scan_total = 0;
+    if (!dbScanPrepare(req)) {
+        addReplyError(req->client, ERROR_OOM, req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    return PROXY_COMMAND_UNHANDLED;
+}
+
+int flushdbReply(void *_reply, void *_req, char *buf, int len) {
+    if (!dbEmulationEnabled())
+        return getFirstMultipleReply(_reply, _req, buf, len);
+    clientRequest *req = _req;
+    uint64_t cursor = 0;
+    sds *keys = NULL;
+    int nkeys = 0, i;
+    if (req->db_scan_state == DB_SCAN_STATE_UNLINK) {
+        if (buf != NULL && len > 0 && buf[0] == '-') {
+            addReplyRaw(req->client, buf, len, req->id);
+            return 1;
+        }
+        req->db_scan_state = DB_SCAN_STATE_SCAN;
+        if (req->db_scan_cursor != 0) {
+            if (!dbScanPrepare(req) || !dbScanEnqueue(req))
+                addReplyError(req->client, ERROR_OOM, req->id);
+            return 1;
+        }
+        goto next_node;
+    }
+    if (!dbScanParseReply(buf, len, &cursor, &keys, &nkeys)) {
+        addReplyError(req->client, ERROR_INVALID_REPLY, req->id);
+        return 1;
+    }
+    req->db_scan_cursor = cursor;
+    if (nkeys > 0) {
+        int ok = dbUnlinkPrepare(req, keys, nkeys);
+        for (i = 0; i < nkeys; i++) sdsfree(keys[i]);
+        zfree(keys);
+        if (!ok) {
+            addReplyError(req->client, ERROR_OOM, req->id);
+            return 1;
+        }
+        req->db_scan_state = DB_SCAN_STATE_UNLINK;
+        if (!dbScanEnqueue(req)) {
+            addReplyError(req->client, ERROR_OOM, req->id);
+        }
+        return 1;
+    }
+    if (keys != NULL) zfree(keys);
+    if (cursor != 0) {
+        if (!dbScanPrepare(req) || !dbScanEnqueue(req))
+            addReplyError(req->client, ERROR_OOM, req->id);
+        return 1;
+    }
+next_node:
+    req->db_scan_node++;
+    req->db_scan_cursor = 0;
+    if (dbMasterNodeByIndex(req, req->db_scan_node) != NULL) {
+        if (!dbScanPrepare(req) || !dbScanEnqueue(req))
+            addReplyError(req->client, ERROR_OOM, req->id);
+        return 1;
+    }
+    addReplyString(req->client, "OK", req->id);
+    return 1;
+}
+
+int swapdbCommand(void *r) {
+    clientRequest *req = r;
+    if (!dbEmulationEnabled()) return PROXY_COMMAND_UNHANDLED;
+    addReplyError(req->client, "SWAPDB is not supported when database "
+                  "emulation is enabled", req->id);
+    return PROXY_COMMAND_HANDLED;
+}
+
+/* MOVE key db: the physical keys of the same logical key in different
+ * databases share the same cluster slot (see dbkey.c), so the operation can
+ * be executed atomically on a single node. */
+int moveCommand(void *r) {
+    clientRequest *req = r;
+    client *c = req->client;
+    if (!dbEmulationEnabled()) return PROXY_COMMAND_UNHANDLED;
+    if (req->argc != 3) return PROXY_COMMAND_UNHANDLED;
+    long long db = 0;
+    sds dbarg = requestArg(req, 2);
+    if (dbarg == NULL || !parseIntArg(dbarg, &db)) {
+        if (dbarg != NULL) sdsfree(dbarg);
+        addReplyError(c, "value is not an integer or out of range", req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    sdsfree(dbarg);
+    if (db < 0 || db >= config.databases) {
+        addReplyError(c, "DB index is out of range", req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    if ((int) db == req->db) {
+        addReplyError(c, "source and destination objects are the same",
+                      req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    sds key = requestArg(req, 1);
+    if (key == NULL) {
+        addReplyError(c, ERROR_OOM, req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    sds src = dbPhysicalKey(req->db, key, sdslen(key));
+    sds dst = dbPhysicalKey((int) db, key, sdslen(key));
+    sdsfree(key);
+    if (src == NULL || dst == NULL) {
+        if (src != NULL) sdsfree(src);
+        if (dst != NULL) sdsfree(dst);
+        addReplyError(c, ERROR_OOM, req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    redisCluster *cluster = getCluster(c);
+    clusterNode *node = getNodeByKey(cluster, src, sdslen(src), NULL);
+    if (node == NULL) {
+        sdsfree(src);
+        sdsfree(dst);
+        addReplyError(c, ERROR_NO_NODE, req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    static const char *script =
+        "if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end\n"
+        "if redis.call('EXISTS', KEYS[2]) == 1 then return 0 end\n"
+        "redis.call('RENAME', KEYS[1], KEYS[2])\n"
+        "return 1";
+    sds *args = zcalloc(sizeof(sds) * 5);
+    if (args == NULL) {
+        sdsfree(src);
+        sdsfree(dst);
+        addReplyError(c, ERROR_OOM, req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    args[0] = sdsnew("EVAL");
+    args[1] = sdsnew(script);
+    args[2] = sdsnew("2");
+    args[3] = src;
+    args[4] = dst;
+    int ok = (args[0] && args[1] && args[2] && args[3] && args[4]);
+    if (ok) ok = requestSetArgs(req, args, 5);
+    freeRequestArgs(args, 5);
+    if (!ok) {
+        addReplyError(c, ERROR_OOM, req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    req->keys_prefixed = 1;
+    req->node = node;
+    req->force_node = 1;
+    return PROXY_COMMAND_UNHANDLED;
+}
+
+/* COPY source destination [DB destination-db] [REPLACE] */
+int copyCommand(void *r) {
+    clientRequest *req = r;
+    client *c = req->client;
+    if (!dbEmulationEnabled()) return PROXY_COMMAND_UNHANDLED;
+    if (req->argc < 3) return PROXY_COMMAND_UNHANDLED;
+    int dst_db = req->db, replace = 0, i;
+    for (i = 3; i < req->argc; ) {
+        sds arg = requestArg(req, i);
+        if (arg == NULL) break;
+        if (!strcasecmp(arg, "db")) {
+            sds value = (i + 1 < req->argc) ? requestArg(req, i + 1) : NULL;
+            long long db = 0;
+            sdsfree(arg);
+            if (value == NULL) return PROXY_COMMAND_UNHANDLED;
+            if (!parseIntArg(value, &db)) {
+                sdsfree(value);
+                addReplyError(c, "value is not an integer or out of range",
+                              req->id);
+                return PROXY_COMMAND_HANDLED;
+            }
+            sdsfree(value);
+            if (db < 0 || db >= config.databases) {
+                addReplyError(c, "DB index is out of range", req->id);
+                return PROXY_COMMAND_HANDLED;
+            }
+            dst_db = (int) db;
+            i += 2;
+            continue;
+        } else if (!strcasecmp(arg, "replace")) {
+            replace = 1;
+            i++;
+        } else {
+            /* Unknown option: let the node reply with a syntax error. */
+            sdsfree(arg);
+            return PROXY_COMMAND_UNHANDLED;
+        }
+        sdsfree(arg);
+    }
+    if (dst_db == req->db) return PROXY_COMMAND_UNHANDLED;
+    sds src_key = requestArg(req, 1), dst_key = requestArg(req, 2);
+    if (src_key == NULL || dst_key == NULL) {
+        if (src_key != NULL) sdsfree(src_key);
+        if (dst_key != NULL) sdsfree(dst_key);
+        addReplyError(c, ERROR_OOM, req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    unsigned int src_slot = clusterKeyHashSlot(src_key, (int) sdslen(src_key));
+    unsigned int dst_slot = clusterKeyHashSlot(dst_key, (int) sdslen(dst_key));
+    if (src_slot != dst_slot) {
+        sdsfree(src_key);
+        sdsfree(dst_key);
+        addReplyError(c, "CROSSSLOT Keys in request don't hash to the same "
+                      "slot", req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    sds src = dbPhysicalKey(req->db, src_key, sdslen(src_key));
+    sds dst = dbPhysicalKey(dst_db, dst_key, sdslen(dst_key));
+    sdsfree(src_key);
+    sdsfree(dst_key);
+    if (src == NULL || dst == NULL) {
+        if (src != NULL) sdsfree(src);
+        if (dst != NULL) sdsfree(dst);
+        addReplyError(c, ERROR_OOM, req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    int nargs = replace ? 4 : 3;
+    sds *args = zcalloc(sizeof(sds) * nargs);
+    int ok = (args != NULL);
+    if (ok) {
+        args[0] = sdsnew("COPY");
+        args[1] = src;
+        args[2] = dst;
+        if (replace) args[3] = sdsnew("REPLACE");
+        ok = (args[0] && args[1] && args[2] && (!replace || args[3]));
+        if (ok) ok = requestSetArgs(req, args, nargs);
+    }
+    freeRequestArgs(args, nargs);
+    if (!ok) {
+        addReplyError(c, ERROR_OOM, req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    req->keys_prefixed = 1;
+    return PROXY_COMMAND_UNHANDLED;
+}
+
+/* SORT: BY/GET patterns must be rewritten like KEYS/SCAN patterns. */
+int sortCommand(void *r) {
+    clientRequest *req = r;
+    if (!dbEmulationEnabled() || req->argc < 2)
+        return PROXY_COMMAND_UNHANDLED;
+    sds *args = requestArgsCopy(req);
+    if (args == NULL) {
+        addReplyError(req->client, ERROR_OOM, req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    int ok = 1, i;
+    for (i = 2; i < req->argc; i++) {
+        int is_by = !strcasecmp(args[i], "by");
+        int is_get = !strcasecmp(args[i], "get");
+        if (!is_by && !is_get) continue;
+        if (i + 1 >= req->argc) break;
+        if (is_get && !strcmp(args[i + 1], "#")) {
+            i++;
+            continue;
+        }
+        if (is_by && !strcasecmp(args[i + 1], "nosort")) {
+            i++;
+            continue;
+        }
+        sds pattern = dbKeyPattern(req->db, args[i + 1],
+                                   sdslen(args[i + 1]));
+        if (pattern == NULL) {
+            ok = 0;
+            break;
+        }
+        sdsfree(args[i + 1]);
+        args[i + 1] = pattern;
+        i++;
+    }
+    if (ok) ok = requestSetArgs(req, args, req->argc);
+    freeRequestArgs(args, req->argc);
+    if (!ok) {
+        addReplyError(req->client, ERROR_OOM, req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    return PROXY_COMMAND_UNHANDLED;
 }
 
 /* KEYS: rewrite the pattern so that it only matches keys of the current
@@ -6122,6 +6625,32 @@ static sds extractBulkPayload(sds reply) {
     return sdsnewlen(payload, (size_t) len);
 }
 
+/* Remove a section (eg. "Keyspace") from an INFO reply payload. */
+static sds removeInfoSection(sds payload, const char *section) {
+    if (payload == NULL) return NULL;
+    sds header = sdscatprintf(sdsempty(), "# %s\r\n", section);
+    if (header == NULL) return payload;
+    char *start = strstr(payload, header);
+    if (start == NULL) {
+        sdsfree(header);
+        return payload;
+    }
+    size_t start_off = (size_t) (start - payload);
+    char *next = strstr(start + 1, "\r\n# ");
+    size_t end_off = (next != NULL) ? (size_t) (next - payload) + 2 :
+                                     sdslen(payload);
+    sds result = sdsnewlen(payload, start_off);
+    if (result != NULL && end_off < sdslen(payload))
+        result = sdscatlen(result, payload + end_off,
+                           sdslen(payload) - end_off);
+    if (result != NULL) {
+        sdsfree(payload);
+        payload = result;
+    }
+    sdsfree(header);
+    return payload;
+}
+
 int getInfoReply(void *_reply, void *_req, char *buf, int len) {
     clientRequest *req = _req;
     client *c = req->client;
@@ -6160,6 +6689,11 @@ int getInfoReply(void *_reply, void *_req, char *buf, int len) {
     } else if (payload == NULL) {
         addReplyError(c, ERROR_INVALID_REPLY, req->id);
     } else {
+        /* Database emulation: all the databases share the cluster's DB 0, so
+         * the node's keyspace section (which reports DB 0) would be
+         * misleading. Clients should use DBSIZE instead. */
+        if (dbEmulationEnabled())
+            payload = removeInfoSection(payload, "Keyspace");
         /* Append the proxy's own sections unless a specific section has been
          * requested. */
         int append_proxy = 1;

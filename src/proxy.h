@@ -99,6 +99,13 @@ typedef struct clientRequest {
     int db;
     int db_set;
     int keys_prefixed;
+    /* State used by commands that iterate the keyspace of a database
+     * (DBSIZE, FLUSHDB). */
+    int db_scan_state;
+    int db_scan_node;
+    uint64_t db_scan_cursor;
+    long long db_scan_total;
+    int db_scan_async;
     list *child_requests;
     rax  *child_replies;
     struct clientRequest *parent_request;

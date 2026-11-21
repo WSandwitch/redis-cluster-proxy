@@ -3,29 +3,28 @@ setup {
     RedisProxyTestCase::GenericSetup.call
     $all_keys = []
     get_keys = proc{
-        $main_cluster.masters.each{|node|
-            r = Redis.new port: node[:port]
-            begin
-                reply = r.keys '*'
-            rescue Redis::CommandError => cmderr
-                reply = cmderr
-            end
-            assert_not_redis_err(reply)
-            $all_keys |= reply
-        }
+        # Query the proxy (not the cluster nodes directly): with database
+        # emulation enabled, the physical keys contain a database prefix that
+        # clients must never see.
+        r = Redis.new port: $main_proxy.port
+        begin
+            reply = r.keys '*'
+        rescue Redis::CommandError => cmderr
+            reply = cmderr
+        end
+        assert_not_redis_err(reply)
+        $all_keys |= reply
     }
     get_keys.call
     if $all_keys.length > max_keys
         $all_keys = []
-        $main_cluster.masters.each{|node|
-            r = Redis.new port: node[:port]
-            begin
-                reply = r.flushdb
-            rescue Redis::CommandError => cmderr
-                reply = cmderr
-            end
-            assert_not_redis_err(reply)
-        }
+        r = Redis.new port: $main_proxy.port
+        begin
+            reply = r.flushall
+        rescue Redis::CommandError => cmderr
+            reply = cmderr
+        end
+        assert_not_redis_err(reply)
         get_keys.call
     end
     if $all_keys.length.zero?
@@ -70,11 +69,7 @@ test "SCAN keys" do
             assert_not_nil match, "Invalid cursor: '#{cursor}'"
             assert_class keys, Array
             mykeys |= keys
-            node_idx = 0
-            if cursor.length > 4 && cursor.to_i != 0
-                node_idx = cursor[-4..-1].to_i
-                log_test_update "node #{node_idx + 1}"
-            end
+            log_test_update "keys #{mykeys.length}/#{$all_keys.length}"
         end
         mykeys.sort!
         assert_equal(mykeys.length, $all_keys.length,

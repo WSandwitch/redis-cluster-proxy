@@ -38,6 +38,14 @@ int configCommand(void *req);
 int scriptCommand(void *req);
 int keysCommand(void *req);
 int randomkeyCommand(void *req);
+int dbsizeCommand(void *req);
+int dbsizeReply(void *reply, void *req, char *buf, int len);
+int flushdbCommand(void *req);
+int flushdbReply(void *reply, void *req, char *buf, int len);
+int moveCommand(void *req);
+int copyCommand(void *req);
+int swapdbCommand(void *req);
+int sortCommand(void *req);
 
 /* Reply Handlers */
 int mergeReplies(void *reply, void *request, char *buf, int len);
@@ -68,8 +76,8 @@ struct redisCommandDef redisCommandTable[245] = {
     {"georadius", -6, 1, 1, 1, 0, 0, NULL, NULL, NULL},
     {"sdiff", -2, 1, -1, 1, 0, 0, NULL, NULL, NULL},
     {"flushdb", -1, 0, 0, 0,
-     CMDFLAG_DUPLICATE,
-     0, NULL, NULL, getFirstMultipleReply},
+     CMDFLAG_DUPLICATE | CMDFLAG_HANDLE_REPLY,
+     0, NULL, flushdbCommand, flushdbReply},
     {"pfmerge", -2, 1, -1, 1, 0, 0, NULL, NULL, NULL},
     {"strlen", 2, 1, 1, 1, 0, 0, NULL, NULL, NULL},
     {"shutdown", -1, 0, 0, 0, 0, 1, NULL, NULL, NULL},
@@ -140,7 +148,9 @@ struct redisCommandDef redisCommandTable[245] = {
     {"xack", -4, 1, 1, 1, 0, 0, NULL, NULL, NULL},
     {"get", 2, 1, 1, 1, 0, 0, NULL, NULL, NULL},
     {"hmset", -4, 1, 1, 1, 0, 0, NULL, NULL, NULL},
-    {"dbsize", 1, 0, 0, 0, 0, 0, NULL, NULL, sumReplies},
+    {"dbsize", 1, 0, 0, 0,
+     CMDFLAG_HANDLE_REPLY,
+     0, NULL, dbsizeCommand, dbsizeReply},
     {"sync", 1, 0, 0, 0, 0, 1, NULL, NULL, NULL},
     {"xgroup", -2, 2, 2, 1, 0, 0, NULL, NULL, NULL},
     {"pfcount", -2, 1, -1, 1, 0, 0, NULL, NULL, NULL},
@@ -179,7 +189,7 @@ struct redisCommandDef redisCommandTable[245] = {
      0, zunionInterGetKeys, NULL, NULL},
     {"ltrim", 4, 1, 1, 1, 0, 0, NULL, NULL, NULL},
     {"xtrim", -4, 1, 1, 1, 0, 0, NULL, NULL, NULL},
-    {"move", 3, 1, 1, 1, 0, 0, NULL, NULL, NULL},
+    {"move", 3, 1, 1, 1, 0, 0, NULL, moveCommand, NULL},
     {"object", -2, 2, 2, 1, 0, 0, NULL, NULL, NULL},
     {"zpopmax", -2, 1, 1, 1, 0, 0, NULL, NULL, NULL},
     {"zcount", 4, 1, 1, 1, 0, 0, NULL, NULL, NULL},
@@ -196,7 +206,7 @@ struct redisCommandDef redisCommandTable[245] = {
     {"zremrangebyrank", 4, 1, 1, 1, 0, 0, NULL, NULL, NULL},
     {"publish", 3, 0, 0, 0, 0, 1, NULL, NULL, NULL},
     {"zrevrangebyscore", -4, 1, 1, 1, 0, 0, NULL, NULL, NULL},
-    {"swapdb", 3, 0, 0, 0, 0, 0, NULL, NULL, NULL},
+    {"swapdb", 3, 0, 0, 0, 0, 0, NULL, swapdbCommand, NULL},
     {"latency", -2, 0, 0, 0, 0, 1, NULL, NULL, NULL},
     {"zscore", 3, 1, 1, 1, 0, 0, NULL, NULL, NULL},
     {"lset", 4, 1, 1, 1, 0, 0, NULL, NULL, NULL},
@@ -295,7 +305,7 @@ struct redisCommandDef redisCommandTable[245] = {
     {"bgsave", -1, 0, 0, 0,
      CMDFLAG_DUPLICATE,
      0, NULL, NULL, getFirstMultipleReply},
-    {"sort", -2, 1, 1, 1, 0, 0, sortGetKeys, NULL, NULL},
+    {"sort", -2, 1, 1, 1, 0, 0, sortGetKeys, sortCommand, NULL},
     {"srandmember", -2, 1, 1, 1, 0, 0, NULL, NULL, NULL},
     {"zrangebylex", -4, 1, 1, 1, 0, 0, NULL, NULL, NULL},
     {"linsert", 5, 1, 1, 1, 0, 0, NULL, NULL, NULL},
@@ -313,7 +323,7 @@ struct redisCommandDef redisCommandTable[245] = {
      commandWithPrivateConnection, NULL, REPLYKEYS_KEY_ARRAY},
     {"bzmpop", -5, 0, 0, 0, 0, 0, evalGetKeys,
      commandWithPrivateConnection, NULL, REPLYKEYS_KEY_ARRAY},
-    {"copy", -3, 1, 2, 1, 0, 0, NULL, NULL, NULL},
+    {"copy", -3, 1, 2, 1, 0, 0, NULL, copyCommand, NULL},
     {"eval_ro", -3, 0, 0, 0, 0, 0, evalGetKeys, NULL, NULL},
     {"evalsha_ro", -3, 0, 0, 0, 0, 0, evalGetKeys, NULL, NULL},
     {"expiretime", 2, 1, 1, 1, 0, 0, NULL, NULL, NULL},
