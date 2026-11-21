@@ -2050,12 +2050,12 @@ int selectCommand(void *r) {
         addReplyError(c, "SELECT is not allowed in MULTI", req->id);
     } else if (!parseIntArg(arg, &db)) {
         addReplyError(c, "value is not an integer or out of range", req->id);
-    } else if (db < 0 || db >= config.databases) {
-        addReplyError(c, "DB index is out of range", req->id);
     } else if (!dbEmulationEnabled() && db != 0) {
         /* Without database emulation the proxy behaves like a Redis Cluster,
          * which only has DB 0. */
         addReplyError(c, "SELECT is not allowed in cluster mode", req->id);
+    } else if (db < 0 || db >= config.databases) {
+        addReplyError(c, "DB index is out of range", req->id);
     } else {
         c->db = (int) db;
         addReplyString(c, "OK", req->id);
@@ -3604,6 +3604,7 @@ int parseOptions(int argc, char **argv) {
         } else if (!strcmp("--disable-db-emulation", arg)) {
             if (config.db_prefix != NULL) zfree(config.db_prefix);
             config.db_prefix = zstrdup("");
+            config.databases = 1;
         } else if (!strcmp("--db-scan-count", arg) && !lastarg) {
             config.db_scan_count = atoi(argv[++i]);
             if (config.db_scan_count < 1) config.db_scan_count = 1;

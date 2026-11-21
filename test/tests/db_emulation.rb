@@ -278,3 +278,28 @@ test "Standalone emulation" do
         }
     }
 end
+
+test "Database emulation can be disabled" do
+    proxy = nil
+    begin
+        proxy = RedisClusterProxy.new $main_cluster,
+            log_level: ($options[:log_level] || 'info'),
+            disable_db_emulation: true,
+            disable_standalone_emulation: true
+        proxy.start
+        spawn_clients(1, proxy: proxy){|client, idx|
+            begin
+                client.select(1)
+                assert(false, "SELECT 1 should fail without DB emulation")
+            rescue Redis::CommandError => e
+                assert_match(e.message, /cluster mode/)
+            end
+            assert_equal(client.select(0), "OK")
+            hello = Hash[*client.call(["HELLO", "2"])]
+            assert_equal(hello["mode"], "cluster")
+            assert_equal(client.call(["READONLY"]), "OK")
+        }
+    ensure
+        proxy.stop if proxy
+    end
+end
