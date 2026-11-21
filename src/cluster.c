@@ -55,7 +55,7 @@ uint16_t crc16(const char *buf, int len);
  * However if the key contains the {...} pattern, only the part between
  * { and } is hashed. This may be useful in the future to force certain
  * keys to be in the same node (assuming no resharding is in progress). */
-static unsigned int clusterKeyHashSlot(char *key, int keylen) {
+unsigned int clusterKeyHashSlot(char *key, int keylen) {
     int s, e; /* start-end indexes of { and } */
 
     for (s = 0; s < keylen; s++)

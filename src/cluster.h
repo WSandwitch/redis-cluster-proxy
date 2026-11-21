@@ -99,6 +99,9 @@ int fetchClusterConfiguration(redisCluster *cluster,
 redisContext *clusterNodeConnect(clusterNode *node);
 void clusterNodeDisconnect(clusterNode *node);
 clusterNode *searchNodeBySlot(redisCluster *cluster, int slot);
+/* Return the cluster hash slot of the given key, honouring the {...} hash tag
+ * syntax used by Redis Cluster. */
+unsigned int clusterKeyHashSlot(char *key, int keylen);
 clusterNode *getNodeByKey(redisCluster *cluster, char *key, int keylen,
                           int *getslot);
 clusterNode *getNodeByName(redisCluster *cluster, const char *name);

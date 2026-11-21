@@ -24,6 +24,7 @@
 #include "endianconv.h"
 #include "util.h"
 #include "help.h"
+#include "dbkey.h"
 #include "reply_order.h"
 #include <stdio.h>
 #include <string.h>
@@ -2175,6 +2176,46 @@ int parseOptions(int argc, char **argv) {
             config.cross_slot_enabled = 1;
         } else if (!strcmp("--disable-cross-slot", arg)) {
             config.cross_slot_enabled = 0;
+        } else if (!strcmp("--databases", arg) && !lastarg) {
+            config.databases = atoi(argv[++i]);
+            if (config.databases < 1 || config.databases > DB_MAX_DATABASES) {
+                fprintf(stderr, "Invalid number of databases '%s': it must "
+                        "be between 1 and %d\n", argv[i], DB_MAX_DATABASES);
+                exit(1);
+            }
+        } else if (!strcmp("--db-prefix", arg) && !lastarg) {
+            if (config.db_prefix != NULL) zfree(config.db_prefix);
+            config.db_prefix = zstrdup(argv[++i]);
+        } else if (!strcmp("--disable-db-emulation", arg)) {
+            if (config.db_prefix != NULL) zfree(config.db_prefix);
+            config.db_prefix = zstrdup("");
+        } else if (!strcmp("--db-scan-count", arg) && !lastarg) {
+            config.db_scan_count = atoi(argv[++i]);
+            if (config.db_scan_count < 1) config.db_scan_count = 1;
+        } else if (!strcmp("--emulate-standalone", arg)) {
+            config.emulate_standalone = 1;
+        } else if (!strcmp("--disable-standalone-emulation", arg)) {
+            config.emulate_standalone = 0;
+        } else if (!strcmp("--cross-slot-write-policy", arg) && !lastarg) {
+            char *val = argv[++i];
+            if (!strcasecmp("allow", val))
+                config.cross_slot_write_policy = CFG_CROSS_SLOT_POLICY_ALLOW;
+            else if (!strcasecmp("error", val))
+                config.cross_slot_write_policy = CFG_CROSS_SLOT_POLICY_ERROR;
+            else if (!strcasecmp("lock", val))
+                config.cross_slot_write_policy = CFG_CROSS_SLOT_POLICY_LOCK;
+            else {
+                fprintf(stderr, "Invalid value for --cross-slot-write-policy: "
+                        "'%s', valid values are: allow|error|lock\n", val);
+                exit(1);
+            }
+        } else if (!strcmp("--cross-slot-lock-timeout", arg) && !lastarg) {
+            config.cross_slot_lock_timeout = atoi(argv[++i]);
+            if (config.cross_slot_lock_timeout < 1)
+                config.cross_slot_lock_timeout = 1;
+        } else if (!strcmp("--cross-slot-lock-ttl", arg) && !lastarg) {
+            config.cross_slot_lock_ttl = atoi(argv[++i]);
+            if (config.cross_slot_lock_ttl < 1) config.cross_slot_lock_ttl = 1;
         } else if (!strcmp("--help", arg) || !strcmp("-h", arg)) {
             printHelp();
             exit(0);

@@ -23,6 +23,7 @@
 #include "sds.h"
 #include "zmalloc.h"
 #include "logger.h"
+#include "dbkey.h"
 
 #define CONFIG_MAX_LINE 1024
 
@@ -44,6 +45,13 @@ void initConfig(void) {
     config.auth = NULL;
     config.auth_user = NULL;
     config.cross_slot_enabled = 1;
+    config.databases = DEFAULT_DATABASES;
+    config.db_prefix = zstrdup(DEFAULT_DB_PREFIX);
+    config.db_scan_count = DEFAULT_DB_SCAN_COUNT;
+    config.emulate_standalone = DEFAULT_EMULATE_STANDALONE;
+    config.cross_slot_write_policy = CFG_CROSS_SLOT_POLICY_ALLOW;
+    config.cross_slot_lock_timeout = DEFAULT_CROSS_SLOT_LOCK_TIMEOUT;
+    config.cross_slot_lock_ttl = DEFAULT_CROSS_SLOT_LOCK_TTL;
     config.bindaddr_count = 0;
     config.pidfile = NULL;
     config.logfile = NULL;
@@ -190,6 +198,23 @@ cleanup:
 }
 
 void checkConfig(void) {
+    const char *db_err = NULL;
+    if (!dbValidatePrefix(config.db_prefix, &db_err)) {
+        fprintf(stderr, "Invalid DB key prefix '%s': %s\n",
+                config.db_prefix ? config.db_prefix : "", db_err);
+        exit(1);
+    }
+    if (!dbSelfCheck()) {
+        fprintf(stderr, "FATAL: invalid hash tag table (src/db_tags.h). "
+                        "Regenerate it with: make db-tags\n");
+        exit(1);
+    }
+    if (!dbEmulationEnabled() && config.databases > 1) {
+        fprintf(stderr, "FATAL: --databases %d requires a non-empty "
+                        "--db-prefix (use --disable-db-emulation to run "
+                        "without database emulation)\n", config.databases);
+        exit(1);
+    }
     if (config.logfile != NULL) {
         /* If the logfile is an empty string, set it NULL and use STDOUT */
         if (config.logfile[0] == '\0') {

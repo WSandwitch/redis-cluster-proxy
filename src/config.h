@@ -36,6 +36,15 @@
 #define DEFAULT_CONNECTIONS_POOL_MINSIZE    10
 #define DEFAULT_CONNECTIONS_POOL_INTERVAL   50
 #define DEFAULT_CONNECTIONS_POOL_SPAWNRATE  2
+#define DEFAULT_DATABASES                   16
+#define DEFAULT_DB_PREFIX                   "%d/"
+#define DEFAULT_DB_SCAN_COUNT               1000
+#define DEFAULT_EMULATE_STANDALONE          1
+#define DEFAULT_CROSS_SLOT_LOCK_TIMEOUT     5000
+#define DEFAULT_CROSS_SLOT_LOCK_TTL         10000
+#define CFG_CROSS_SLOT_POLICY_ALLOW         0
+#define CFG_CROSS_SLOT_POLICY_ERROR         1
+#define CFG_CROSS_SLOT_POLICY_LOCK          2
 
 #define MAX_ENTRY_POINTS_WARN_MSG "You cannot use more than %d entry points, "\
                                   "skipping entry point '%s'"
@@ -67,6 +76,13 @@ typedef struct {
     char *auth_user;
     int disable_multiplexing;
     int cross_slot_enabled;
+    int databases;
+    char *db_prefix;
+    int db_scan_count;
+    int emulate_standalone;
+    int cross_slot_write_policy;
+    int cross_slot_lock_timeout;
+    int cross_slot_lock_ttl;
     int bindaddr_count;
     char *bindaddr[BINDADDR_MAX];
     char *pidfile;
