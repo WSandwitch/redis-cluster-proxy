@@ -25,27 +25,27 @@ Those commands are supported by Redis Cluster Proxy.
  - CLIENT
  - COMMAND
  - CONFIG
- - COPY
- - DBSIZE (**sums multiple replies**)
+ - COPY (**supports DB, requires same slot**)
+ - DBSIZE (**sums multiple replies**, **SCAN-based when database emulation is enabled**)
  - DECR
  - DECRBY
  - DEL (**sums multiple replies**)
  - DISCARD
  - DUMP
  - ECHO
- - EVAL
- - EVALSHA
- - EVALSHA_RO
+ - EVAL (**script keys are prefixed, see README**)
+ - EVALSHA (**script keys are prefixed, see README**)
+ - EVALSHA_RO (**script keys are prefixed, see README**)
  - EVAL_RO
  - EXEC
  - EXISTS (**sums multiple replies**)
  - EXPIRE
  - EXPIREAT
  - EXPIRETIME
- - FCALL
- - FCALL_RO
+ - FCALL (**script keys are prefixed, see README**)
+ - FCALL_RO (**script keys are prefixed, see README**)
  - FLUSHALL
- - FLUSHDB
+ - FLUSHDB (**SCAN-based when database emulation is enabled**)
  - FUNCTION
  - GEOADD
  - GEODIST
@@ -85,7 +85,7 @@ Those commands are supported by Redis Cluster Proxy.
  - INCRBY
  - INCRBYFLOAT
  - INFO
- - KEYS (**merges multiple replies**)
+ - KEYS (**merges multiple replies**, **database-aware**)
  - LASTSAVE
  - LCS
  - LINDEX
@@ -103,7 +103,7 @@ Those commands are supported by Redis Cluster Proxy.
  - LSET
  - LTRIM
  - MGET (**merges multiple replies**)
- - MOVE
+ - MOVE (**atomic between databases**)
  - MSET
  - MSETNX
  - MULTI (**disables multiplexing**)
@@ -120,7 +120,7 @@ Those commands are supported by Redis Cluster Proxy.
  - PSETEX
  - PTTL
  - QUIT
- - RANDOMKEY
+ - RANDOMKEY (**database-aware, best-effort when database emulation is enabled**)
  - READONLY
  - READWRITE
  - RENAME
@@ -135,7 +135,7 @@ Those commands are supported by Redis Cluster Proxy.
  - RPUSHX
  - SADD
  - SAVE
- - SCAN
+ - SCAN (**database-aware**)
  - SCARD
  - SCRIPT
  - SDIFF
@@ -163,7 +163,7 @@ Those commands are supported by Redis Cluster Proxy.
  - SUBSTR
  - SUNION
  - SUNIONSTORE (**cross-slots unsupported**)
- - SWAPDB
+ - SWAPDB (**not supported when database emulation is enabled**)
  - TIME
  - TOUCH (**sums multiple replies**)
  - TTL

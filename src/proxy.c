@@ -38,6 +38,7 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/utsname.h>
 #include "assert.h" /* Use proxy's assert */
 
@@ -1058,6 +1059,392 @@ static void addReplyWithStrippedKeys(clientRequest *req, const char *buf,
 }
 
 /* -----------------------------------------------------------------------------
+ * Cross-slot lock (C1)
+ *
+ * When the cross-slot write policy is "lock", cross-slot write commands are
+ * serialized across all the proxies connected to the cluster by taking a
+ * global lock stored in Redis under a hash tag (so that every proxy uses the
+ * same slot and therefore the same node).
+ *
+ * The lock does NOT provide crash-atomicity and does not block single-key
+ * operations: it only prevents two cross-slot write commands (issued through
+ * any of the proxies using the same lock protocol) from interleaving.
+ * -------------------------------------------------------------------------- */
+
+#define CROSS_SLOT_LOCK_KEY     "{__proxy:lock}"
+#define CROSS_SLOT_LOCK_RETRY_MS 5
+
+static int lockAcquireReply(void *reply, void *req, char *buf, int len);
+static int lockReleaseReply(void *reply, void *req, char *buf, int len);
+static void lockSendAcquire(proxyThread *thread);
+static void lockReleaseHolder(clientRequest *holder);
+static void lockSendRelease(proxyThread *thread, client *c);
+
+static redisCommandDef lockAcquireCommandDef = {
+    "set", -3, 0, 0, 0, CMDFLAG_HANDLE_REPLY, 0, NULL, NULL,
+    lockAcquireReply, REPLYKEYS_NONE
+};
+
+static redisCommandDef lockReleaseCommandDef = {
+    "eval", -3, 0, 0, 0, CMDFLAG_HANDLE_REPLY, 0, NULL, NULL,
+    lockReleaseReply, REPLYKEYS_NONE
+};
+
+static long long lockNowMs(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (long long) tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+static int lockTimerCallback(aeEventLoop *el, long long id, void *privdata);
+
+static void lockClearTimer(proxyThread *thread) {
+    if (thread->lock_timer_id != -1) {
+        aeDeleteTimeEvent(thread->loop, thread->lock_timer_id);
+        thread->lock_timer_id = -1;
+    }
+    thread->lock_retry_armed = 0;
+}
+
+static void lockArmTimer(proxyThread *thread, long long ms) {
+    lockClearTimer(thread);
+    if (thread->loop == NULL) return;
+    thread->lock_timer_id = aeCreateTimeEvent(thread->loop, ms,
+                                              lockTimerCallback, thread, NULL);
+    thread->lock_retry_armed = (thread->lock_timer_id != -1);
+}
+
+static void lockFreeToken(proxyThread *thread) {
+    if (thread->lock_token != NULL) {
+        sdsfree(thread->lock_token);
+        thread->lock_token = NULL;
+    }
+}
+
+/* Create an internal request (not visible to the client) on behalf of `c`. */
+static clientRequest *createInternalRequest(client *c) {
+    clientRequest *current = c->current_request;
+    clientRequest *req = createRequest(c, 1);
+    c->current_request = current;
+    if (req == NULL) return NULL;
+    req->parsed = 1;
+    req->db_set = 1;
+    req->keys_prefixed = 1;
+    req->is_lock_request = 1;
+    return req;
+}
+
+static clientRequest *lockQueueFirst(proxyThread *thread) {
+    if (thread->lock_queue == NULL) return NULL;
+    listNode *ln = listFirst(thread->lock_queue);
+    if (ln == NULL) return NULL;
+    return ln->value;
+}
+
+/* Fail a queued request, replying with an error. */
+static void lockFailWaiter(proxyThread *thread, clientRequest *waiter,
+                           const char *err) {
+    listNode *ln = NULL;
+    if (thread->lock_queue != NULL)
+        ln = listSearchKey(thread->lock_queue, waiter);
+    if (ln != NULL) listDelNode(thread->lock_queue, ln);
+    waiter->lock_queued = 0;
+    thread->lock_deadline = 0;
+    addReplyError(waiter->client, err, waiter->id);
+    freeRequest(waiter);
+}
+
+/* Send a "SET ... NX PX" request for the first request in the queue. */
+static void lockSendAcquire(proxyThread *thread) {
+    if (thread->loop == NULL) return;
+    if (thread->lock_busy || thread->lock_holder != NULL) return;
+    clientRequest *waiter = lockQueueFirst(thread);
+    if (waiter == NULL) return;
+    client *c = waiter->client;
+    if (c == NULL || c->status == CLIENT_STATUS_UNLINKED) {
+        /* Drop the waiter from the queue without freeing it: it is being
+         * freed by its client (and freeing it here could double-free it while
+         * the client's request list is being iterated). */
+        listNode *ln = listFirst(thread->lock_queue);
+        if (ln != NULL) listDelNode(thread->lock_queue, ln);
+        waiter->lock_queued = 0;
+        lockSendAcquire(thread);
+        return;
+    }
+    redisCluster *cluster = getCluster(c);
+    clusterNode *node = getNodeByKey(cluster, CROSS_SLOT_LOCK_KEY,
+                                     strlen(CROSS_SLOT_LOCK_KEY), NULL);
+    if (node == NULL) {
+        lockFailWaiter(thread, waiter, ERROR_NO_NODE);
+        return;
+    }
+    if (thread->lock_token == NULL) {
+        thread->lock_token = sdscatprintf(sdsempty(), "%d:%llu:%ld",
+                                          thread->thread_id,
+                                          (unsigned long long) c->id,
+                                          (long) random());
+    }
+    clientRequest *req = createInternalRequest(c);
+    if (req == NULL) {
+        lockFailWaiter(thread, waiter, ERROR_OOM);
+        return;
+    }
+    sds *args = zcalloc(sizeof(sds) * 6);
+    int ok = (args != NULL && thread->lock_token != NULL);
+    if (ok) {
+        args[0] = sdsnew("SET");
+        args[1] = sdsnew(CROSS_SLOT_LOCK_KEY);
+        args[2] = sdsdup(thread->lock_token);
+        args[3] = sdsnew("NX");
+        args[4] = sdsnew("PX");
+        args[5] = sdscatprintf(sdsempty(), "%d",
+                               config.cross_slot_lock_ttl);
+        ok = (args[0] && args[1] && args[2] && args[3] && args[4] && args[5]);
+        if (ok) ok = requestSetArgs(req, args, 6);
+    }
+    freeRequestArgs(args, 6);
+    if (!ok) {
+        freeRequest(req);
+        lockFailWaiter(thread, waiter, ERROR_OOM);
+        return;
+    }
+    req->command = &lockAcquireCommandDef;
+    req->node = node;
+    req->force_node = 1;
+    thread->lock_busy = 1;
+    if (thread->lock_deadline == 0)
+        thread->lock_deadline = lockNowMs() + config.cross_slot_lock_timeout;
+    if (!enqueueRequestToSend(req)) {
+        thread->lock_busy = 0;
+        freeRequest(req);
+        lockFailWaiter(thread, waiter, ERROR_CLUSTER_WRITE_FAIL);
+        return;
+    }
+    lockArmTimer(thread, config.cross_slot_lock_timeout);
+    handleNextRequestsToCluster(node, NULL);
+}
+
+/* Release the lock held by `holder` (if any). */
+static void lockSendRelease(proxyThread *thread, client *c) {
+    if (thread->loop == NULL) return;
+    if (thread->lock_token == NULL) return;
+    if (c == NULL || c->status == CLIENT_STATUS_UNLINKED) {
+        /* The client is gone: let the lock expire. */
+        lockFreeToken(thread);
+        thread->lock_holder = NULL;
+        lockSendAcquire(thread);
+        return;
+    }
+    static const char *script =
+        "if redis.call('GET', KEYS[1]) == ARGV[1] then\n"
+        "  return redis.call('DEL', KEYS[1])\n"
+        "end\n"
+        "return 0";
+    redisCluster *cluster = getCluster(c);
+    clusterNode *node = getNodeByKey(cluster, CROSS_SLOT_LOCK_KEY,
+                                     strlen(CROSS_SLOT_LOCK_KEY), NULL);
+    if (node == NULL) {
+        lockFreeToken(thread);
+        thread->lock_holder = NULL;
+        lockSendAcquire(thread);
+        return;
+    }
+    clientRequest *req = createInternalRequest(c);
+    if (req == NULL) {
+        lockFreeToken(thread);
+        thread->lock_holder = NULL;
+        lockSendAcquire(thread);
+        return;
+    }
+    sds *args = zcalloc(sizeof(sds) * 5);
+    int ok = (args != NULL);
+    if (ok) {
+        args[0] = sdsnew("EVAL");
+        args[1] = sdsnew(script);
+        args[2] = sdsnew("1");
+        args[3] = sdsnew(CROSS_SLOT_LOCK_KEY);
+        args[4] = sdsdup(thread->lock_token);
+        ok = (args[0] && args[1] && args[2] && args[3] && args[4]);
+        if (ok) ok = requestSetArgs(req, args, 5);
+    }
+    freeRequestArgs(args, 5);
+    if (!ok) {
+        freeRequest(req);
+        lockFreeToken(thread);
+        thread->lock_holder = NULL;
+        lockSendAcquire(thread);
+        return;
+    }
+    req->command = &lockReleaseCommandDef;
+    req->node = node;
+    req->force_node = 1;
+    thread->lock_busy = 1;
+    thread->lock_holder = NULL;
+    if (!enqueueRequestToSend(req)) {
+        thread->lock_busy = 0;
+        freeRequest(req);
+        lockFreeToken(thread);
+        lockSendAcquire(thread);
+        return;
+    }
+    lockArmTimer(thread, config.cross_slot_lock_timeout);
+    handleNextRequestsToCluster(node, NULL);
+}
+
+/* Release the lock held by `holder`, if any, and continue with the next queued
+ * request. */
+static void lockReleaseHolder(clientRequest *holder) {
+    if (holder == NULL) return;
+    proxyThread *thread = getThread(holder->client);
+    client *c = holder->client;
+    holder->lock_acquired = 0;
+    if (thread->lock_holder == holder) thread->lock_holder = NULL;
+    lockSendRelease(thread, c);
+}
+
+static int lockAcquireReply(void *reply, void *r, char *buf, int len) {
+    UNUSED(reply);
+    clientRequest *req = r;
+    proxyThread *thread = getThread(req->client);
+    freeRequest(req);
+    thread->lock_busy = 0;
+    lockClearTimer(thread);
+    int acquired = (buf != NULL && len >= 5 && !memcmp(buf, "+OK\r\n", 5));
+    clientRequest *waiter = lockQueueFirst(thread);
+    if (!acquired) {
+        if (waiter == NULL) {
+            lockFreeToken(thread);
+            return 1;
+        }
+        if (lockNowMs() >= thread->lock_deadline) {
+            lockFreeToken(thread);
+            thread->lock_deadline = 0;
+            lockFailWaiter(thread, waiter,
+                           "Cross-slot lock acquisition timed out");
+            lockSendAcquire(thread);
+        } else {
+            lockArmTimer(thread, CROSS_SLOT_LOCK_RETRY_MS);
+        }
+        return 1;
+    }
+    if (waiter == NULL) {
+        /* Nobody is waiting: release the lock immediately. */
+        thread->lock_holder = NULL;
+        lockFreeToken(thread);
+        return 1;
+    }
+    listNode *ln = listFirst(thread->lock_queue);
+    if (ln != NULL) listDelNode(thread->lock_queue, ln);
+    waiter->lock_queued = 0;
+    waiter->lock_acquired = 1;
+    thread->lock_deadline = 0;
+    thread->lock_holder = waiter;
+    /* Continue processing the request, now that the lock is held. */
+    processRequest(waiter, NULL, NULL);
+    return 1;
+}
+
+static int lockReleaseReply(void *reply, void *r, char *buf, int len) {
+    UNUSED(reply);
+    UNUSED(buf);
+    UNUSED(len);
+    clientRequest *req = r;
+    proxyThread *thread = getThread(req->client);
+    freeRequest(req);
+    thread->lock_busy = 0;
+    lockClearTimer(thread);
+    lockFreeToken(thread);
+    lockSendAcquire(thread);
+    return 1;
+}
+
+static int lockTimerCallback(aeEventLoop *el, long long id, void *privdata) {
+    UNUSED(el);
+    UNUSED(id);
+    proxyThread *thread = privdata;
+    thread->lock_timer_id = -1;
+    thread->lock_retry_armed = 0;
+    if (thread->lock_busy) {
+        /* The lock command seems to be lost: give up on it. */
+        thread->lock_busy = 0;
+        thread->lock_deadline = 0;
+        clientRequest *waiter = lockQueueFirst(thread);
+        if (waiter != NULL) {
+            lockFreeToken(thread);
+            lockFailWaiter(thread, waiter,
+                           "Cross-slot lock acquisition timed out");
+            lockSendAcquire(thread);
+        } else lockFreeToken(thread);
+        return AE_NOMORE;
+    }
+    if (thread->lock_holder == NULL) lockSendAcquire(thread);
+    return AE_NOMORE;
+}
+
+/* Queue a cross-slot write request waiting for the lock. */
+static int lockEnqueueRequest(clientRequest *req) {
+    proxyThread *thread = getThread(req->client);
+    if (thread->lock_queue == NULL) {
+        thread->lock_queue = listCreate();
+        if (thread->lock_queue == NULL) return 0;
+    }
+    if (listLength(thread->lock_queue) == 0) thread->lock_deadline = 0;
+    listAddNodeTail(thread->lock_queue, req);
+    req->lock_queued = 1;
+    lockSendAcquire(thread);
+    return 1;
+}
+
+/* Return 1 if the request is a cross-slot write command that would be split
+ * into multiple queries. */
+static int requestIsCrossSlotWrite(clientRequest *req) {
+    if (req->command == NULL) return 0;
+    if (!config.cross_slot_enabled) return 0;
+    if (!commandIsWrite(req->command->name)) return 0;
+    if (req->command->proxy_flags & CMDFLAG_MULTISLOT_UNSUPPORTED) return 0;
+    if (req->command->handleReply == NULL) return 0;
+    if (req->argc < 3) return 0;
+    int first_key = req->command->first_key,
+        last_key = req->command->last_key,
+        key_step = req->command->key_step, i;
+    int *skip = NULL, skiplen = 0;
+    if (req->command->get_keys != NULL) {
+        char *keys_err = NULL;
+        int numkeys = req->command->get_keys(req, &first_key, &last_key,
+                                             &key_step, &skip, &skiplen,
+                                             &keys_err);
+        if (numkeys < 0) {
+            if (skip != NULL) zfree(skip);
+            return 0;
+        }
+    }
+    if (first_key < 1) {
+        if (skip != NULL) zfree(skip);
+        return 0;
+    }
+    if (last_key >= req->argc) last_key = req->argc - 1;
+    if (last_key < 0) last_key = req->argc + last_key;
+    if (last_key < first_key) {
+        if (skip != NULL) zfree(skip);
+        return 0;
+    }
+    if (key_step < 1) key_step = 1;
+    int slot = -1, cross_slot = 0, skipped = 0;
+    for (i = first_key; !cross_slot && i <= last_key; i += key_step) {
+        if (skip != NULL && skipped < skiplen && i == skip[skipped]) {
+            skipped++;
+            continue;
+        }
+        int s = (int) clusterKeyHashSlot(req->buffer + req->offsets[i],
+                                         req->lengths[i]);
+        if (slot == -1) slot = s;
+        else if (s != slot) cross_slot = 1;
+    }
+    if (skip != NULL) zfree(skip);
+    return cross_slot;
+}
+
+/* -----------------------------------------------------------------------------
  * Database-wide commands (DBSIZE, FLUSHDB, MOVE, COPY, SWAPDB, SORT)
  * -------------------------------------------------------------------------- */
 
@@ -1238,6 +1625,7 @@ int dbsizeReply(void *_reply, void *_req, char *buf, int len) {
     int nkeys = 0;
     if (!dbScanParseReply(buf, len, &cursor, NULL, &nkeys)) {
         addReplyError(req->client, ERROR_INVALID_REPLY, req->id);
+        freeRequest(req);
         return 1;
     }
     req->db_scan_total += nkeys;
@@ -1245,6 +1633,7 @@ int dbsizeReply(void *_reply, void *_req, char *buf, int len) {
         req->db_scan_cursor = cursor;
         if (!dbScanPrepare(req) || !dbScanEnqueue(req)) {
             addReplyError(req->client, ERROR_OOM, req->id);
+            freeRequest(req);
         }
         return 1;
     }
@@ -1253,10 +1642,12 @@ int dbsizeReply(void *_reply, void *_req, char *buf, int len) {
     if (dbMasterNodeByIndex(req, req->db_scan_node) != NULL) {
         if (!dbScanPrepare(req) || !dbScanEnqueue(req)) {
             addReplyError(req->client, ERROR_OOM, req->id);
+            freeRequest(req);
         }
         return 1;
     }
     addReplyInt(req->client, req->db_scan_total, req->id);
+    freeRequest(req);
     return 1;
 }
 
@@ -1282,6 +1673,8 @@ int flushdbCommand(void *r) {
         sdsfree(arg);
     }
     req->db_scan_async = async;
+    if (config.cross_slot_write_policy == CFG_CROSS_SLOT_POLICY_LOCK)
+        req->lock_whole_command = 1;
     req->db_scan_state = DB_SCAN_STATE_SCAN;
     req->db_scan_node = 0;
     req->db_scan_cursor = 0;
@@ -1302,19 +1695,24 @@ int flushdbReply(void *_reply, void *_req, char *buf, int len) {
     int nkeys = 0, i;
     if (req->db_scan_state == DB_SCAN_STATE_UNLINK) {
         if (buf != NULL && len > 0 && buf[0] == '-') {
+            if (req->lock_acquired) lockReleaseHolder(req);
             addReplyRaw(req->client, buf, len, req->id);
+            freeRequest(req);
             return 1;
         }
         req->db_scan_state = DB_SCAN_STATE_SCAN;
         if (req->db_scan_cursor != 0) {
-            if (!dbScanPrepare(req) || !dbScanEnqueue(req))
+            if (!dbScanPrepare(req) || !dbScanEnqueue(req)) {
                 addReplyError(req->client, ERROR_OOM, req->id);
+                freeRequest(req);
+            }
             return 1;
         }
         goto next_node;
     }
     if (!dbScanParseReply(buf, len, &cursor, &keys, &nkeys)) {
         addReplyError(req->client, ERROR_INVALID_REPLY, req->id);
+        freeRequest(req);
         return 1;
     }
     req->db_scan_cursor = cursor;
@@ -1324,29 +1722,37 @@ int flushdbReply(void *_reply, void *_req, char *buf, int len) {
         zfree(keys);
         if (!ok) {
             addReplyError(req->client, ERROR_OOM, req->id);
+            freeRequest(req);
             return 1;
         }
         req->db_scan_state = DB_SCAN_STATE_UNLINK;
         if (!dbScanEnqueue(req)) {
             addReplyError(req->client, ERROR_OOM, req->id);
+            freeRequest(req);
         }
         return 1;
     }
     if (keys != NULL) zfree(keys);
     if (cursor != 0) {
-        if (!dbScanPrepare(req) || !dbScanEnqueue(req))
+        if (!dbScanPrepare(req) || !dbScanEnqueue(req)) {
             addReplyError(req->client, ERROR_OOM, req->id);
+            freeRequest(req);
+        }
         return 1;
     }
 next_node:
     req->db_scan_node++;
     req->db_scan_cursor = 0;
     if (dbMasterNodeByIndex(req, req->db_scan_node) != NULL) {
-        if (!dbScanPrepare(req) || !dbScanEnqueue(req))
+        if (!dbScanPrepare(req) || !dbScanEnqueue(req)) {
             addReplyError(req->client, ERROR_OOM, req->id);
+            freeRequest(req);
+        }
         return 1;
     }
+    if (req->lock_acquired) lockReleaseHolder(req);
     addReplyString(req->client, "OK", req->id);
+    freeRequest(req);
     return 1;
 }
 
@@ -1619,6 +2025,9 @@ int randomkeyCommand(void *r) {
         addReplyError(c, ERROR_OOM, req->id);
         return PROXY_COMMAND_HANDLED;
     }
+    /* Inside a transaction we can only query the transaction's node, so just
+     * run the SCAN on it (the reply handler will pick a random key). */
+    if (req->client->multi_transaction) return PROXY_COMMAND_UNHANDLED;
     /* The keys of a database can be spread over all the master nodes, so
      * query all of them and pick a random key among all the replies. */
     if (!duplicateRequestForAllMasters(req)) {
@@ -1669,6 +2078,34 @@ int okCommand(void *r) {
     clientRequest *req = r;
     addReplyString(req->client, "OK", req->id);
     return PROXY_COMMAND_HANDLED;
+}
+
+/* CLUSTER and cluster-related commands: when standalone emulation is enabled
+ * they behave like on a standalone Redis instance. */
+int clusterCommand(void *r) {
+    clientRequest *req = r;
+    if (config.emulate_standalone) {
+        addReplyError(req->client, "This instance has cluster support disabled",
+                      req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    sds err = sdscatprintf(sdsempty(), "unsupported command `%.*s`", 128,
+                           req->command->name);
+    addReplyError(req->client, err, req->id);
+    sdsfree(err);
+    return PROXY_COMMAND_HANDLED;
+}
+
+/* READONLY/READWRITE/ASKING: a standalone Redis replies with an error since
+ * it has no cluster support. */
+int readOnlyCommand(void *r) {
+    clientRequest *req = r;
+    if (config.emulate_standalone) {
+        addReplyError(req->client, "This instance has cluster support disabled",
+                      req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    return okCommand(r);
 }
 
 int resetCommand(void *r) {
@@ -1783,18 +2220,20 @@ int helloCommand(void *r) {
     }
     if (auth_user) sdsfree(auth_user);
     if (auth_pass) sdsfree(auth_pass);
+    const char *mode = config.emulate_standalone ? "standalone" : "cluster";
     sds reply = sdscatfmt(sdsempty(),
         "*14\r\n"
         "$6\r\nserver\r\n$5\r\nredis\r\n"
         "$7\r\nversion\r\n$%u\r\n%s\r\n"
         "$5\r\nproto\r\n:2\r\n"
         "$2\r\nid\r\n:%U\r\n"
-        "$4\r\nmode\r\n$7\r\ncluster\r\n"
+        "$4\r\nmode\r\n$%u\r\n%s\r\n"
         "$4\r\nrole\r\n$6\r\nmaster\r\n"
         "$7\r\nmodules\r\n*0\r\n",
         (unsigned int) strlen(PROXY_REDIS_COMPAT_VERSION),
         PROXY_REDIS_COMPAT_VERSION,
-        (unsigned long long) c->id);
+        (unsigned long long) c->id,
+        (unsigned int) strlen(mode), mode);
     addReplyRaw(c, reply, sdslen(reply), req->id);
     sdsfree(reply);
     return PROXY_COMMAND_HANDLED;
@@ -2302,6 +2741,7 @@ int proxyCommand(void *r) {
                 }
             }
             if (loglvl < 0) {
+                sdsfree(lvlname);
                 err = sdsnew("Invalid log level, valid level names: ");
                 for (i = 0; i <= LOGLEVEL_ERROR; i++) {
                     char *sep = (i > 0 ? ", " : "");
@@ -2309,6 +2749,7 @@ int proxyCommand(void *r) {
                 }
                 goto final;
             }
+            sdsfree(lvlname);
             offset = req->offsets[3];
             len = req->lengths[3];
             msg = sdsnewlen(req->buffer + offset, len);
@@ -2571,6 +3012,12 @@ static void scanReplySampleKey(clientRequest *req, const char *buf, size_t len,
 int getRandomReply(void *_reply, void *_req, char *buf, int len) {
     UNUSED(_reply);
     clientRequest *req = _req;
+    /* The handler is called with `buf == NULL` when all the child replies
+     * have been collected (in that case the parent is freed by the caller),
+     * and with the raw reply when the request was not duplicated (eg. inside
+     * a MULTI transaction): in the latter case the request must be freed
+     * here, since the caller does not free handled replies. */
+    int from_children = (buf == NULL && len == 0);
     if (dbEmulationEnabled()) {
         /* In database emulation mode RANDOMKEY is implemented as a SCAN with
          * a random starting cursor and a MATCH pattern for the current
@@ -2600,12 +3047,14 @@ int getRandomReply(void *_reply, void *_req, char *buf, int len) {
                                   req->id);
             sdsfree(selected);
         }
+        if (!from_children) freeRequest(req);
         return 1;
     }
     raxIterator iter;
     if (req->child_replies == NULL) {
         /* Single reply (eg. inside a MULTI transaction). */
         addReplyRaw(req->client, buf, len, req->id);
+        freeRequest(req);
         return 1;
     }
     raxStart(&iter, req->child_replies);
@@ -3036,7 +3485,10 @@ void printHelp(void) {
         DEFAULT_TCP_KEEPALIVE, DEFAULT_TCP_BACKLOG, DEFAULT_PID_FILE,
         DEFAULT_UNIXSOCKETPERM, DEFAULT_CONNECTIONS_POOL_SIZE, MAX_POOL_SIZE,
         DEFAULT_CONNECTIONS_POOL_MINSIZE, DEFAULT_CONNECTIONS_POOL_INTERVAL,
-        DEFAULT_CONNECTIONS_POOL_SPAWNRATE);
+        DEFAULT_CONNECTIONS_POOL_SPAWNRATE,
+        DEFAULT_CROSS_SLOT_LOCK_TIMEOUT, DEFAULT_CROSS_SLOT_LOCK_TTL);
+    fprintf(stderr, mainHelpString2,
+        DEFAULT_DATABASES, DEFAULT_DB_PREFIX, DEFAULT_DB_SCAN_COUNT);
 }
 
 int parseOptions(int argc, char **argv) {
@@ -3702,6 +4154,12 @@ static proxyThread *createProxyThread(int index) {
     thread->process_clients = 0;
     thread->connections_pool = listCreate();
     thread->is_spawning_connections = 0;
+    thread->lock_queue = listCreate();
+    thread->lock_holder = NULL;
+    thread->lock_token = NULL;
+    thread->lock_busy = 0;
+    thread->lock_retry_armed = 0;
+    thread->lock_timer_id = -1;
     thread->cluster = createCluster(index);
     if (thread->cluster == NULL) {
         proxyLogErr("ERROR: failed to allocate cluster for thread: %d",
@@ -3873,6 +4331,14 @@ static void freeProxyThread(proxyThread *thread) {
     if (thread->unlinked_clients) {
         listRelease(thread->unlinked_clients);
         thread->unlinked_clients = NULL;
+    }
+    if (thread->lock_queue != NULL) {
+        listRelease(thread->lock_queue);
+        thread->lock_queue = NULL;
+    }
+    if (thread->lock_token != NULL) {
+        sdsfree(thread->lock_token);
+        thread->lock_token = NULL;
     }
     if (thread->io[0]) close(thread->io[0]);
     if (thread->io[1]) close(thread->io[1]);
@@ -5298,6 +5764,12 @@ static clusterNode *getRequestNode(clientRequest *req, sds *err) {
                            req->command->handleReply == NULL)
                 {
                     errmsg = ERROR_COMMAND_UNSUPPORTED_CROSSSLOT;
+                } else if (config.cross_slot_write_policy ==
+                           CFG_CROSS_SLOT_POLICY_ERROR &&
+                           commandIsWrite(req->command->name))
+                {
+                    errmsg = "CROSSSLOT Keys in request don't hash to the "
+                             "same slot";
                 } else if (!splitMultiSlotRequest(req, i)) {
                     errmsg = "Failed to handle cross-slot request";
                 }
@@ -5321,6 +5793,27 @@ static clusterNode *getRequestNode(clientRequest *req, sds *err) {
 
 void freeRequest(clientRequest *req) {
     if (req == NULL) return;
+    if (req->lock_queued || req->lock_acquired) {
+        proxyThread *thread = getThread(req->client);
+        if (req->lock_queued) {
+            if (thread->lock_queue != NULL) {
+                listNode *ln = listSearchKey(thread->lock_queue, req);
+                if (ln != NULL) listDelNode(thread->lock_queue, ln);
+            }
+            req->lock_queued = 0;
+        }
+        if (req->lock_acquired) {
+            if (thread->lock_holder == req) thread->lock_holder = NULL;
+            req->lock_acquired = 0;
+            if (thread->loop != NULL) lockReleaseHolder(req);
+        }
+        if (thread->loop != NULL && !thread->lock_busy &&
+            thread->lock_holder == NULL && thread->lock_queue != NULL &&
+            req->client->status != CLIENT_STATUS_UNLINKED)
+        {
+            lockSendAcquire(thread);
+        }
+    }
     aeEventLoop *el = getClientLoop(req->client);
     if (req->need_reprocessing && el != NULL) return;
     proxyLogDebug("Free Request " REQID_PRINTF_FMT, REQID_PRINTF_ARG(req));
@@ -5771,14 +6264,18 @@ int processRequest(clientRequest *req, int *parsing_status,
         goto invalid_request;
     }
     req->command = cmd;
-    if (cmd->handle) {
-        int handled = cmd->handle(req);
-        if (handled == PROXY_COMMAND_HANDLED) {
-            if (command_name) sdsfree(command_name);
-            /* Some handled commands (eg. MULTI) take ownership of the request
-             * and keep it alive: in that case do not free it here. */
-            if (req != c->multi_request) freeRequest(req);
-            return 1;
+    if (!req->handler_done) {
+        req->handler_done = 1;
+        if (cmd->handle) {
+            int handled = cmd->handle(req);
+            if (handled == PROXY_COMMAND_HANDLED) {
+                if (command_name) sdsfree(command_name);
+                /* Some handled commands (eg. MULTI) take ownership of the
+                 * request and keep it alive: in that case do not free it
+                 * here. */
+                if (req != c->multi_request) freeRequest(req);
+                return 1;
+            }
         }
     }
     redisCluster *cluster = getCluster(c);
@@ -5795,6 +6292,18 @@ int processRequest(clientRequest *req, int *parsing_status,
         if (errmsg == NULL) errmsg = sdsnew(ERROR_INVALID_QUERY);
         proxyLogDebug("%s " REQID_PRINTF_FMT, errmsg, REQID_PRINTF_ARG(req));
         goto invalid_request;
+    }
+    if (config.cross_slot_write_policy == CFG_CROSS_SLOT_POLICY_LOCK &&
+        !req->lock_acquired && req->parent_request == NULL &&
+        !c->multi_transaction &&
+        (req->lock_whole_command || requestIsCrossSlotWrite(req)))
+    {
+        if (!lockEnqueueRequest(req)) {
+            errmsg = sdsnew(ERROR_OOM);
+            goto invalid_request;
+        }
+        if (command_name) sdsfree(command_name);
+        return 1;
     }
     clusterNode *node = getRequestNode(req, &errmsg);
     if (node == NULL) {
@@ -6051,6 +6560,7 @@ static int addChildRequestReply(clientRequest *req, char *replybuf, int len) {
             addReplyError(parent->client, ERROR_COMMAND_UNSUPPORTED_CROSSSLOT,
                           parent->id);
         }
+        if (parent->lock_acquired) lockReleaseHolder(parent);
         freeRequest(parent);
     }
     return completed;
@@ -6190,7 +6700,8 @@ static int processClusterReplyBuffer(redisContext *ctx, clusterNode *node,
         {
             int is_moved = (strstr(reply->str, "MOVED") == reply->str);
             int is_ask = (strstr(reply->str, "ASK") == reply->str);
-            if (is_ask && handleAskReply(req, reply->str)) {
+            if (!req->is_lock_request && is_ask &&
+                handleAskReply(req, reply->str)) {
                 /* The request has been re-queued to the ASK target node. */
                 req = NULL;
                 free_req = 0;
@@ -6202,7 +6713,7 @@ static int processClusterReplyBuffer(redisContext *ctx, clusterNode *node,
              * we add the request to the clusters' `requests_to_reprocess`
              * pool (the request will be also added to a
              * `requests_to_reprocess` list on the client). */
-            if (is_ask || is_moved)
+            if (!req->is_lock_request && (is_ask || is_moved))
             {
                 proxyLogDebug("Cluster configuration changed! "
                               "(request " REQID_PRINTF_FMT ")",
@@ -6625,6 +7136,27 @@ static sds extractBulkPayload(sds reply) {
     return sdsnewlen(payload, (size_t) len);
 }
 
+/* Replace all the occurrences of `from` in `str` with `to`, returning a new
+ * sds (the input is freed). */
+static sds replaceAll(sds str, const char *from, const char *to) {
+    if (str == NULL) return NULL;
+    size_t from_len = strlen(from), to_len = strlen(to);
+    sds out = sdsempty();
+    if (out == NULL) return str;
+    char *p = str, *match;
+    while ((match = strstr(p, from)) != NULL) {
+        out = sdscatlen(out, p, (size_t) (match - p));
+        if (out == NULL) break;
+        out = sdscatlen(out, to, to_len);
+        if (out == NULL) break;
+        p = match + from_len;
+    }
+    if (out != NULL) out = sdscat(out, p);
+    if (out == NULL) return str;
+    sdsfree(str);
+    return out;
+}
+
 /* Remove a section (eg. "Keyspace") from an INFO reply payload. */
 static sds removeInfoSection(sds payload, const char *section) {
     if (payload == NULL) return NULL;
@@ -6694,6 +7226,14 @@ int getInfoReply(void *_reply, void *_req, char *buf, int len) {
          * misleading. Clients should use DBSIZE instead. */
         if (dbEmulationEnabled())
             payload = removeInfoSection(payload, "Keyspace");
+        /* Standalone emulation: clients should not see that they are talking
+         * to a cluster. */
+        if (config.emulate_standalone) {
+            payload = replaceAll(payload, "redis_mode:cluster",
+                                 "redis_mode:standalone");
+            payload = replaceAll(payload, "cluster_enabled:1",
+                                 "cluster_enabled:0");
+        }
         /* Append the proxy's own sections unless a specific section has been
          * requested. */
         int append_proxy = 1;

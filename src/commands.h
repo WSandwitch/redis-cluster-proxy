@@ -86,4 +86,7 @@ typedef struct redisCommandDef {
 
 extern struct redisCommandDef redisCommandTable[245];
 
+/* Return 1 if the command is a write command (has the Redis WRITE flag). */
+int commandIsWrite(const char *name);
+
 #endif /* __REDIS_CLUSTER_PROXY_COMMANDS_H__  */

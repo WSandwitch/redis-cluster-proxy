@@ -3,14 +3,15 @@
 > This is a fork of RedisLabs's cluster proxy, targeting compatibility with **Redis 7.2** (the last BSD-licensed Redis 7.x release) so that it can be used as a drop-in replacement for a single Redis instance in RESP2 mode.
 >
 > Main differences from the original proxy:
-> - `SELECT 0` is accepted; `SELECT` with a non-zero DB returns an error, since a Redis Cluster only has DB 0.
+> - multiple databases are emulated (`SELECT n` switches the key prefix, see "Database emulation" below); `MOVE` and `COPY ... DB` work across databases.
 > - `INFO` returns the info of the first master node plus the proxy's own sections.
 > - `HELLO 2` is supported (RESP2); `HELLO 3` returns `NOPROTO`.
 > - `CLIENT SETNAME/GETNAME/ID/INFO/SETINFO`, `QUIT`, `RESET`, `READONLY`, `READWRITE` and `ASKING` are handled locally.
 > - `CONFIG`, `SCRIPT` and `FUNCTION` are supported (`CONFIG SET`, `SCRIPT LOAD/FLUSH/EXISTS` and `FUNCTION` mutations are broadcast to all masters).
-> - Cross-slot queries are enabled by default (they are not atomic; see below).
+> - Cross-slot queries are enabled by default (they are not atomic); an optional lock mode and a strict `error` mode are available (see "Cross-slot write policy" below).
 > - Pub/Sub is not supported yet: Pub/Sub commands return an explicit unsupported-command error.
-> - RESP3, client-side caching (`CLIENT TRACKING`), `SELECT db > 0` and cluster administration commands are not supported.
+> - RESP3, client-side caching (`CLIENT TRACKING`) and cluster administration commands are not supported.
+> - `HELLO`/`INFO` report a standalone Redis instance and cluster-only commands reply with `This instance has cluster support disabled` (see "Standalone emulation" below).
 >
 > It also integrates various pull requests with **bug fixes** (see commits list for details).
 >
@@ -188,6 +189,74 @@ Since their execution is not guaranteed to be atomic (so, they can actually brea
 **WARNING**: cross-slot queries are not atomic. If the client disconnects or a node fails while the query is being executed, only part of the command may be applied.
 
 **Note**: cross-slots queries are not supported by all the commands, even if the feature is enabled (ie. you cannot use it with `EVAL` or `ZUNIONSTORE` and many other commands). In that case, you'll receive a specific error reply. You can fetch a list of commands that cannot be used in cross-slots queries by using the `PROXY` command (see below).
+
+# Cross-slot write policy
+
+When cross-slot queries are enabled, the proxy can handle multi-key commands whose keys belong to different slots by splitting them into multiple queries. Such queries are not atomic, so three policies are available (`--cross-slot-write-policy`):
+
+- `allow` (default): execute cross-slot write queries. Fast, but a crash or a network failure in the middle of the query can leave the data partially updated.
+- `error`: reject cross-slot write queries with a `CROSSSLOT` error, like a real Redis Cluster does. Use hash tags (eg. `{user}:1`, `{user}:2`) for operations that must be atomic.
+- `lock`: serialize cross-slot write queries using a global lock stored in the cluster, so that two cross-slot write queries issued through **any** proxy using the same protocol cannot interleave.
+
+The lock is stored under the `{__proxy:lock}` key (the hash tag makes every proxy use the same slot). Its TTL and the maximum time a client can wait for it can be configured with `--cross-slot-lock-ttl` and `--cross-slot-lock-timeout`.
+
+**Limitations of the `lock` policy**:
+- it does **not** block single-key operations: a plain `SET` issued while a cross-slot query holds the lock can still be interleaved with it (use `error` plus hash tags if you need strict atomicity);
+- it does **not** provide crash-atomicity: if the proxy dies in the middle of a cross-slot query, part of it may remain applied (the lock is eventually released by its TTL);
+- every proxy that takes part in the serialization must use the same lock configuration.
+
+# Database emulation
+
+A Redis Cluster only has DB 0, while clients of a standalone Redis can use `SELECT` to choose one of many databases. To behave like a drop-in replacement for a standalone Redis instance, the proxy emulates multiple databases by prefixing every key with the database number.
+
+The physical key of a logical key `foo` in database `n` is:
+
+```
+<n>/<hash-tag>foo
+```
+
+where `<hash-tag>` is a three-character tag chosen so that:
+
+```
+CRC16(hash-tag) % 16384 == slot(foo)
+```
+
+Keeping the original slot means that the same key in two different databases lives on the **same cluster node**, so `MOVE` and `COPY` between databases are single-slot operations that Redis can execute atomically. It also means that enabling database emulation does not change the slot layout of the keys.
+
+Configuration:
+
+```
+databases 16
+db-prefix "%d/"
+```
+
+- `SELECT n` accepts `0 <= n < databases`, replies with `OK` and switches the prefix; other values reply with `DB index is out of range`.
+- `SELECT` is not allowed inside `MULTI` (it could split the transaction across different slots).
+- `RESET` goes back to database 0, `CLIENT INFO` reports the selected database.
+- The prefix is applied to **all** databases, including DB 0 (`0/foo`), so that no key is visible from two databases.
+- `KEYS`, `SCAN` (including its `MATCH` option), `RANDOMKEY`, `DBSIZE`, `FLUSHDB`, `MOVE`, `COPY ... DB` and the blocking/pop/stream commands are database-aware.
+- `DBSIZE` and `FLUSHDB` are implemented with `SCAN` and are therefore O(N); their `COUNT` can be tuned with `--db-scan-count`.
+- `SCAN` cursors encode the database they belong to: reusing a cursor in another database replies with `invalid cursor`.
+- `SWAPDB` is not supported.
+- `INFO keyspace` is omitted, since all the emulated databases share the cluster's DB 0; use `DBSIZE` instead.
+- `COPY src dst DB n` is allowed only if the two keys hash to the same slot (which is always the case when `src == dst`), otherwise it replies with `CROSSSLOT`.
+
+Use `disable-db-emulation yes` (or `--disable-db-emulation`) to turn the feature off: in that case the proxy behaves like a Redis Cluster and only DB 0 is available.
+
+**Limitations**:
+- scripts executed with `EVAL`/`FCALL` see the **physical** key names (`KEYS[1]` is `n/<tag>foo`), so they must only use `KEYS[i]` and never build key names from `ARGV`;
+- `FUNCTION` libraries and `SCRIPT` caches are global per node: they are not isolated per database;
+- `SORT BY`/`GET` patterns are rewritten for the current database, but Redis Cluster itself denies `SORT BY`;
+- enabling database emulation on a cluster that already contains unprefixed keys makes those keys invisible (the slots are preserved, so they can be migrated by renaming them).
+
+# Standalone emulation
+
+By default (`--emulate-standalone`) the proxy replies like a standalone Redis instance:
+
+- `HELLO` reports `mode:standalone` and `INFO` reports `redis_mode:standalone`, `cluster_enabled:0`;
+- `CLUSTER`, `READONLY`, `READWRITE` and `ASKING` reply with `ERR This instance has cluster support disabled`, exactly like a standalone Redis.
+
+Use `--disable-standalone-emulation` to reply like a Redis Cluster instead.
 
 # The PROXY command
 

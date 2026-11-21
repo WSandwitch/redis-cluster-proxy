@@ -16,6 +16,8 @@
 require 'bundler/setup'
 require 'redis'
 require 'hiredis'
+require 'timeout'
+require 'shellwords'
 require 'time'
 
 $redis_proxy_test_libdir ||= File.expand_path(File.dirname(__FILE__))
@@ -98,7 +100,10 @@ class RedisClusterProxy
                   "--log-file=\"#{@valgrind_logfile}\" #{cmd}"
         end
         STDOUT.flush
-        @pid = Process.spawn cmd, out: @logfile, err: @logfile
+        # Spawn without an intermediate shell, so that @pid is the actual
+        # process (or valgrind) and SIGTERM reaches it directly.
+        @pid = Process.spawn(*Shellwords.split(cmd), out: @logfile,
+                             err: @logfile, pgroup: true)
         $test_proxies ||= []
         $test_proxies |= [self]
         loop do
@@ -118,7 +123,27 @@ class RedisClusterProxy
         if @pid
             log "Stopping proxy to 127.0.0.1:#{@entry_point[:port]} " +
                 "with PID #{@pid}", :gray
-            Process.kill('TERM', @pid)
+            pid = @pid
+            begin
+                Process.kill('TERM', -pid)
+            rescue Errno::ESRCH
+                Process.kill('TERM', pid)
+            end
+            # Wait for the process to terminate: valgrind needs to flush its
+            # report before exiting, otherwise the summary is lost.
+            begin
+                Timeout.timeout(@valgrind ? 30 : 10){ Process.wait(pid) }
+            rescue Timeout::Error
+                begin
+                    Process.kill('KILL', pid)
+                rescue Errno::ESRCH
+                end
+                begin
+                    Process.wait(pid)
+                rescue Errno::ECHILD
+                end
+            rescue Errno::ECHILD
+            end
             $test_proxies ||= []
             $test_proxies -= [self]
             @pid = nil

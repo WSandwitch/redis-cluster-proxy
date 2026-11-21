@@ -23,6 +23,7 @@ extern const char *proxyCommandSubcommandClientHelp[];
 extern const char *proxyCommandSubcommandClusterHelp[];
 extern const char *proxyCommandSubcommandDebugtHelp[];
 extern const char *mainHelpString;
+extern const char *mainHelpString2;
 
 void printHelp(void);
 

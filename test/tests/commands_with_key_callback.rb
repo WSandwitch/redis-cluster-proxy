@@ -77,12 +77,18 @@ $datalen.each{|len|
             keys = (1..numkeys).map{|n|
                 "K:{#{tag}}:#{n}"
             }
-            script = "return {#{(1..numkeys).map{|n|
-                "KEYS[#{n}]"
-            }.join(',')}}"
+            keys.each_with_index{|k, i|
+                client.set k, "value:#{i}"
+            }
+            # Note: with database emulation enabled the script sees the
+            # physical key names, so return values instead of KEYS.
+            script = "local r = {} " \
+                     "for i = 1, #KEYS do r[i] = redis.call('GET', KEYS[i]) " \
+                     "end return r"
             reply = client.eval script, keys
             assert_not_redis_err(reply)
-            assert_equal(keys, reply)
+            expected = (0...numkeys).map{|i| "value:#{i}" }
+            assert_equal(expected, reply)
         }
     end
 

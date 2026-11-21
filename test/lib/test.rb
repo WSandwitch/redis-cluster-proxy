@@ -282,8 +282,10 @@ class RedisProxyTestCase
         log_same_line("[  ] #{test[:name]} #{message}")
     end
 
-    def log_to_proxy(proxy, msg)
-        proxy.redis_command :proxy, 'log', msg
+    def log_to_proxy(proxy, msg, level = 'info')
+        # Use an explicit level: with the default log level (info) a DEBUG
+        # message would be filtered out.
+        proxy.redis_command :proxy, 'log', level, msg
     end
 
     def on_exception(e)

@@ -38,6 +38,8 @@ int configCommand(void *req);
 int scriptCommand(void *req);
 int keysCommand(void *req);
 int randomkeyCommand(void *req);
+int clusterCommand(void *req);
+int readOnlyCommand(void *req);
 int dbsizeCommand(void *req);
 int dbsizeReply(void *reply, void *req, char *buf, int len);
 int flushdbCommand(void *req);
@@ -69,7 +71,7 @@ int numkeysGetKeys(void *req, int *first_key, int *last_key,
 
 struct redisCommandDef redisCommandTable[245] = {
     {"bitpos", -3, 1, 1, 1, 0, 0, NULL, NULL, NULL},
-    {"cluster", -2, 0, 0, 0, 0, 1, NULL, NULL, NULL},
+    {"cluster", -2, 0, 0, 0, 0, 0, NULL, clusterCommand, NULL},
     {"randomkey", 1, 0, 0, 0,
      CMDFLAG_HANDLE_REPLY,
      0, NULL, randomkeyCommand, getRandomReply, REPLYKEYS_BULK},
@@ -181,7 +183,7 @@ struct redisCommandDef redisCommandTable[245] = {
     {"echo", 2, 0, 0, 0, 0, 0, NULL, NULL, getFirstMultipleReply},
     {"exec", 1, 0, 0, 0, 0, 0, NULL, execOrDiscardCommand, NULL},
     {"geoadd", -5, 1, 1, 1, 0, 0, NULL, NULL, NULL},
-    {"readwrite", 1, 0, 0, 0, 0, 0, NULL, okCommand, NULL},
+    {"readwrite", 1, 0, 0, 0, 0, 0, NULL, readOnlyCommand, NULL},
     {"touch", -2, 1, -1, 1, 0, 0, NULL, NULL, sumReplies},
     {"expireat", -3, 1, 1, 1, 0, 0, NULL, NULL, NULL},
     {"zinterstore", -4, 0, 0, 0,
@@ -215,7 +217,7 @@ struct redisCommandDef redisCommandTable[245] = {
      0, NULL, scanCommand, handleScanReply, REPLYKEYS_SCAN},
     {"debug", -2, 0, 0, 0, 0, 1, NULL, NULL, NULL},
     {"zrevrank", -3, 1, 1, 1, 0, 0, NULL, NULL, NULL},
-    {"asking", 1, 0, 0, 0, 0, 0, NULL, okCommand, NULL},
+    {"asking", 1, 0, 0, 0, 0, 0, NULL, readOnlyCommand, NULL},
     {"zremrangebylex", 4, 1, 1, 1, 0, 0, NULL, NULL, NULL},
     {"georadiusbymember", -5, 1, 1, 1, 0, 0, NULL, NULL, NULL},
     {"hlen", 2, 1, 1, 1, 0, 0, NULL, NULL, NULL},
@@ -301,7 +303,7 @@ struct redisCommandDef redisCommandTable[245] = {
     {"getrange", 4, 1, 1, 1, 0, 0, NULL, NULL, NULL},
     {"xsetid", -3, 1, 1, 1, 0, 0, NULL, NULL, NULL},
     {"lindex", 3, 1, 1, 1, 0, 0, NULL, NULL, NULL},
-    {"readonly", 1, 0, 0, 0, 0, 0, NULL, okCommand, NULL},
+    {"readonly", 1, 0, 0, 0, 0, 0, NULL, readOnlyCommand, NULL},
     {"bgsave", -1, 0, 0, 0,
      CMDFLAG_DUPLICATE,
      0, NULL, NULL, getFirstMultipleReply},
@@ -364,3 +366,40 @@ struct redisCommandDef redisCommandTable[245] = {
     /* Custom Commands */
     {"proxy", -2, 0, 0, 0, 0, 0, NULL, proxyCommand, NULL}
 };
+
+/* Redis commands having the WRITE flag (generated from the Redis 7.2 command
+ * specifications). Used to decide whether a cross-slot query is a write when
+ * the cross-slot write policy is "error" or "lock". Sorted for bsearch
+ * (well, for the plain binary search below). */
+static const char *WRITE_COMMANDS[] = {
+    "append", "bitfield", "bitop", "blmove", "blmpop", "blpop", "brpop",
+    "brpoplpush", "bzmpop", "bzpopmax", "bzpopmin", "copy", "decr", "decrby",
+    "del", "expire", "expireat", "flushall", "flushdb", "geoadd", "georadius",
+    "georadiusbymember", "geosearchstore", "getdel", "getex", "getset",
+    "hdel", "hincrby", "hincrbyfloat", "hmset", "hset", "hsetnx", "incr",
+    "incrby", "incrbyfloat", "linsert", "lmove", "lmpop", "lpop", "lpush",
+    "lpushx", "lrem", "lset", "ltrim", "migrate", "move", "mset", "msetnx",
+    "persist", "pexpire", "pexpireat", "pfadd", "pfdebug", "pfmerge",
+    "psetex", "rename", "renamenx", "restore", "rpop", "rpoplpush", "rpush",
+    "rpushx", "sadd", "sdiffstore", "set", "setbit", "setex", "setnx",
+    "setrange", "sinterstore", "smove", "sort", "spop", "srem", "sunionstore",
+    "swapdb", "unlink", "xack", "xadd", "xautoclaim", "xclaim", "xdel",
+    "xreadgroup", "xsetid", "xtrim", "zadd", "zdiffstore", "zincrby",
+    "zinterstore", "zmpop", "zpopmax", "zpopmin", "zrangestore", "zrem",
+    "zremrangebylex", "zremrangebyrank", "zremrangebyscore", "zunionstore",
+};
+
+#define WRITE_COMMANDS_COUNT 98
+
+int commandIsWrite(const char *name) {
+    int lo = 0, hi = WRITE_COMMANDS_COUNT - 1;
+    if (name == NULL) return 0;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        int cmp = strcmp(name, WRITE_COMMANDS[mid]);
+        if (cmp == 0) return 1;
+        if (cmp < 0) hi = mid - 1;
+        else lo = mid + 1;
+    }
+    return 0;
+}

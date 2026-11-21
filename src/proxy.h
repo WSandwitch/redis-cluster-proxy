@@ -66,6 +66,14 @@ typedef struct proxyThread {
     uint64_t next_client_id;
     _Atomic uint64_t process_clients;
     sds msgbuffer;
+    /* Cross-slot lock (C1) state, see proxy.c */
+    list *lock_queue;          /* clientRequest* waiting for the lock */
+    struct clientRequest *lock_holder; /* request currently holding the lock */
+    sds lock_token;            /* token of the lock being held/acquired */
+    int lock_busy;             /* a lock command is in flight */
+    int lock_retry_armed;
+    long long lock_deadline;   /* acquisition deadline (ms) */
+    long long lock_timer_id;
 } proxyThread;
 
 typedef struct clientRequest {
@@ -106,6 +114,11 @@ typedef struct clientRequest {
     uint64_t db_scan_cursor;
     long long db_scan_total;
     int db_scan_async;
+    int handler_done;
+    int lock_acquired;
+    int lock_queued;
+    int lock_whole_command;
+    int is_lock_request;
     list *child_requests;
     rax  *child_replies;
     struct clientRequest *parent_request;
