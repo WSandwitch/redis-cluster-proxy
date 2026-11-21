@@ -26,6 +26,22 @@
 
 #define PROXY_REPLY_UNHANDLED      2
 
+/* Layout of the key names contained in a command's reply. Used by database
+ * emulation to strip the database prefix before replying to the client. */
+#define REPLYKEYS_NONE             0
+/* Array of keys (eg. KEYS). */
+#define REPLYKEYS_ARRAY            1
+/* A single bulk key (eg. RANDOMKEY). */
+#define REPLYKEYS_BULK             2
+/* [cursor, [keys]] (eg. SCAN). */
+#define REPLYKEYS_SCAN             3
+/* [key, value] (eg. BLPOP, BRPOP, BZPOPMIN, BZPOPMAX). */
+#define REPLYKEYS_KEY_VALUE        4
+/* [key, [values]] (eg. LMPOP, ZMPOP, BLMPOP, BZMPOP). */
+#define REPLYKEYS_KEY_ARRAY        5
+/* [[stream, entries...], ...] (eg. XREAD, XREADGROUP). */
+#define REPLYKEYS_STREAMS          6
+
 #define CMDFLAG_MULTISLOT_UNSUPPORTED 1 << 0
 #define CMDFLAG_DUPLICATE 1 << 1
 #define CMDFLAG_HANDLE_REPLY 1 << 2
@@ -62,6 +78,9 @@ typedef struct redisCommandDef {
     redisClusterGetKeysCallback     *get_keys;
     redisClusterProxyCommandHandler *handle;
     redisClusterProxyReplyHandler   *handleReply;
+    /* Layout of the key names contained in the reply (see REPLYKEYS_*): it is
+     * used to strip the database prefix when database emulation is enabled. */
+    int reply_keys;
 } redisCommandDef;
 
 

@@ -36,6 +36,7 @@
 #include "sds.h"
 
 #define DB_MAX_DATABASES 1024
+#define DB_KEY_SLOTS 16384
 
 /* Return 1 if database emulation is enabled (ie. a non-empty key prefix has
  * been configured). */

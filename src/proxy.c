@@ -779,6 +779,352 @@ static int parseIntArg(sds arg, long long *out) {
     return 1;
 }
 
+/* Return a newly allocated array containing a copy of all the request's
+ * arguments, or NULL on allocation failure. */
+static sds *requestArgsCopy(clientRequest *req) {
+    int i;
+    sds *args = zmalloc(sizeof(sds) * (req->argc > 0 ? req->argc : 1));
+    if (args == NULL) return NULL;
+    for (i = 0; i < req->argc; i++) {
+        args[i] = requestArg(req, i);
+        if (args[i] == NULL) {
+            while (--i >= 0) sdsfree(args[i]);
+            zfree(args);
+            return NULL;
+        }
+    }
+    return args;
+}
+
+static void freeRequestArgs(sds *args, int argc) {
+    int i;
+    if (args == NULL) return;
+    for (i = 0; i < argc; i++) sdsfree(args[i]);
+    zfree(args);
+}
+
+/* Replace the request's arguments (and rebuild its buffer) with the given
+ * array, which is not modified and can be freed by the caller. Return 1 on
+ * success. */
+static int requestSetArgs(clientRequest *req, sds *args, int argc) {
+    int i;
+    if (argc < 0) return 0;
+    if (argc > req->offsets_size) {
+        int new_size = argc + QUERY_OFFSETS_MIN_SIZE;
+        int *offsets = zrealloc(req->offsets, new_size * sizeof(int));
+        int *lengths = zrealloc(req->lengths, new_size * sizeof(int));
+        if (offsets == NULL || lengths == NULL) return 0;
+        req->offsets = offsets;
+        req->lengths = lengths;
+        req->offsets_size = new_size;
+    }
+    sds newbuf = sdsempty();
+    if (newbuf == NULL) return 0;
+    newbuf = sdscatfmt(newbuf, "*%u\r\n", (unsigned int) argc);
+    for (i = 0; i < argc; i++) {
+        size_t len = args[i] ? sdslen(args[i]) : 0;
+        newbuf = sdscatfmt(newbuf, "$%U\r\n", (unsigned long long) len);
+        if (newbuf == NULL) return 0;
+        req->offsets[i] = (int) sdslen(newbuf);
+        if (len > 0) {
+            newbuf = sdscatlen(newbuf, args[i], len);
+            if (newbuf == NULL) return 0;
+        }
+        newbuf = sdscatlen(newbuf, "\r\n", 2);
+        if (newbuf == NULL) return 0;
+        req->lengths[i] = (int) len;
+    }
+    sdsfree(req->buffer);
+    req->buffer = newbuf;
+    req->argc = argc;
+    req->is_multibulk = 1;
+    req->num_commands = 1;
+    req->query_offset = sdslen(newbuf);
+    req->pending_bulks = 0;
+    req->current_bulk_length = 0;
+    return 1;
+}
+
+/* Rewrite all the key arguments of the request so that they point to the
+ * physical keys of the request's database (see database emulation). */
+static int prefixRequestKeys(clientRequest *req, sds *err) {
+    int i;
+    if (!dbEmulationEnabled() || req->keys_prefixed) return 1;
+    if (req->command == NULL) return 1;
+    if (req->command->proxy_flags & CMDFLAG_FIRST_MASTER) return 1;
+    int first_key = req->command->first_key,
+        last_key = req->command->last_key,
+        key_step = req->command->key_step;
+    int *skip = NULL, skiplen = 0;
+    if (req->command->get_keys != NULL) {
+        char *keys_err = NULL;
+        int numkeys = req->command->get_keys(req, &first_key, &last_key,
+                                            &key_step, &skip, &skiplen,
+                                            &keys_err);
+        if (numkeys < 0) {
+            if (err != NULL)
+                *err = sdsnew(keys_err ? keys_err : ERROR_INVALID_QUERY);
+            if (skip != NULL) zfree(skip);
+            return 0;
+        }
+        if (numkeys == 0) {
+            if (skip != NULL) zfree(skip);
+            return 1;
+        }
+    }
+    if (first_key < 1) {
+        if (skip != NULL) zfree(skip);
+        return 1;
+    }
+    if (last_key >= req->argc) last_key = req->argc - 1;
+    if (last_key < 0) last_key = req->argc + last_key;
+    if (last_key < first_key) {
+        if (skip != NULL) zfree(skip);
+        return 1;
+    }
+    if (key_step < 1) key_step = 1;
+    sds *args = requestArgsCopy(req);
+    int ok = (args != NULL), skipped = 0;
+    for (i = first_key; ok && i <= last_key; i += key_step) {
+        if (skip != NULL && skipped < skiplen && i == skip[skipped]) {
+            skipped++;
+            continue;
+        }
+        sds physical = dbPhysicalKey(req->db, args[i], sdslen(args[i]));
+        if (physical == NULL) {
+            ok = 0;
+            break;
+        }
+        sdsfree(args[i]);
+        args[i] = physical;
+    }
+    if (ok) ok = requestSetArgs(req, args, req->argc);
+    freeRequestArgs(args, req->argc);
+    if (skip != NULL) zfree(skip);
+    if (!ok) {
+        if (err != NULL) *err = sdsnew(ERROR_OOM);
+        return 0;
+    }
+    req->keys_prefixed = 1;
+    return 1;
+}
+
+/* -----------------------------------------------------------------------------
+ * Reply key stripping (database emulation)
+ *
+ * When database emulation is enabled, keys are stored with a
+ * "<db>/<tag>" prefix (see dbkey.c), so replies containing key names must be
+ * rewritten before being sent to the client.
+ * -------------------------------------------------------------------------- */
+
+#define REPLMODE_COPY               0
+#define REPLMODE_STRIP_BULK         1
+#define REPLMODE_ARRAY_STRIP_ALL    2
+#define REPLMODE_ARRAY_FIRST        3
+#define REPLMODE_ARRAY_NESTED_FIRST 4
+#define REPLMODE_SCAN               5
+
+/* Return the offset just past the RESP object starting at `pos`, or 0 if the
+ * object is incomplete or malformed. */
+static size_t respObjectEnd(const char *buf, size_t len, size_t pos) {
+    if (pos >= len) return 0;
+    char type = buf[pos];
+    const char *nl = memchr(buf + pos, '\n', len - pos);
+    if (nl == NULL) return 0;
+    size_t eol = (size_t) (nl - buf);
+    if (type == '$') {
+        long n = strtol(buf + pos + 1, NULL, 10);
+        if (n < 0) return eol + 1;
+        size_t data = eol + 1;
+        if (data + (size_t) n + 2 > len) return 0;
+        return data + (size_t) n + 2;
+    }
+    if (type == '*' || type == '~') {
+        long n = strtol(buf + pos + 1, NULL, 10);
+        size_t p = eol + 1;
+        long i;
+        if (n < 0) return p;
+        for (i = 0; i < n; i++) {
+            p = respObjectEnd(buf, len, p);
+            if (p == 0) return 0;
+        }
+        return p;
+    }
+    /* Simple strings, errors, integers and nulls. */
+    return eol + 1;
+}
+
+static sds appendRespObject(sds out, int db, const char *buf, size_t len,
+                            size_t *pos, int mode, int *changed) {
+    if (out == NULL) return NULL;
+    if (mode == REPLMODE_COPY) {
+        size_t end = respObjectEnd(buf, len, *pos);
+        if (end == 0) return NULL;
+        out = sdscatlen(out, buf + *pos, end - *pos);
+        *pos = end;
+        return out;
+    }
+    if (*pos >= len) return NULL;
+    char type = buf[*pos];
+    if (type != '$' && type != '*') return NULL;
+    const char *nl = memchr(buf + *pos, '\n', len - *pos);
+    if (nl == NULL) return NULL;
+    size_t eol = (size_t) (nl - buf);
+    long count = strtol(buf + *pos + 1, NULL, 10);
+    size_t p = eol + 1;
+    if (type == '$') {
+        if (count < 0) {
+            out = sdscatlen(out, "$-1\r\n", 5);
+            *pos = p;
+            return out;
+        }
+        if (p + (size_t) count + 2 > len) return NULL;
+        if (mode == REPLMODE_STRIP_BULK) {
+            sds stripped = dbStripKey(db, buf + p, (size_t) count);
+            if (stripped != NULL) {
+                out = sdscatfmt(out, "$%U\r\n",
+                                (unsigned long long) sdslen(stripped));
+                if (out != NULL) out = sdscatsds(out, stripped);
+                if (out != NULL) out = sdscatlen(out, "\r\n", 2);
+                if (sdslen(stripped) != (size_t) count) *changed = 1;
+                sdsfree(stripped);
+                *pos = p + (size_t) count + 2;
+                return out;
+            }
+        }
+        out = sdscatlen(out, buf + *pos, p + (size_t) count + 2 - *pos);
+        *pos = p + (size_t) count + 2;
+        return out;
+    }
+    if (count < 0) {
+        out = sdscatlen(out, "*-1\r\n", 5);
+        *pos = p;
+        return out;
+    }
+    out = sdscatfmt(out, "*%I\r\n", (long long) count);
+    long i;
+    for (i = 0; i < count; i++) {
+        int child_mode = REPLMODE_COPY;
+        if (mode == REPLMODE_ARRAY_STRIP_ALL)
+            child_mode = REPLMODE_STRIP_BULK;
+        else if (mode == REPLMODE_ARRAY_FIRST)
+            child_mode = (i == 0 ? REPLMODE_STRIP_BULK : REPLMODE_COPY);
+        else if (mode == REPLMODE_ARRAY_NESTED_FIRST)
+            child_mode = REPLMODE_ARRAY_FIRST;
+        else if (mode == REPLMODE_SCAN)
+            child_mode = (i == 1 ? REPLMODE_ARRAY_STRIP_ALL : REPLMODE_COPY);
+        out = appendRespObject(out, db, buf, len, &p, child_mode, changed);
+        if (out == NULL) return NULL;
+    }
+    *pos = p;
+    return out;
+}
+
+/* Return a rewritten copy of the reply with database prefixes stripped from
+ * the key names, or NULL if the reply does not need (or cannot be) rewritten;
+ * in the latter case the original reply should be used. */
+static sds stripReplyKeys(int db, const char *buf, size_t len, int layout) {
+    int mode = REPLMODE_COPY, changed = 0;
+    switch (layout) {
+    case REPLYKEYS_ARRAY:     mode = REPLMODE_ARRAY_STRIP_ALL; break;
+    case REPLYKEYS_BULK:      mode = REPLMODE_STRIP_BULK; break;
+    case REPLYKEYS_SCAN:      mode = REPLMODE_SCAN; break;
+    case REPLYKEYS_KEY_VALUE:
+    case REPLYKEYS_KEY_ARRAY: mode = REPLMODE_ARRAY_FIRST; break;
+    case REPLYKEYS_STREAMS:   mode = REPLMODE_ARRAY_NESTED_FIRST; break;
+    default: return NULL;
+    }
+    size_t pos = 0;
+    sds out = sdsempty();
+    out = appendRespObject(out, db, buf, len, &pos, mode, &changed);
+    if (out == NULL) return NULL;
+    if (!changed) {
+        sdsfree(out);
+        return NULL;
+    }
+    return out;
+}
+
+/* Write the reply to the client, stripping the database prefix from key
+ * names when needed. */
+static void addReplyWithStrippedKeys(clientRequest *req, const char *buf,
+                                     size_t len) {
+    sds stripped = NULL;
+    if (dbEmulationEnabled() && req->command != NULL &&
+        req->command->reply_keys != REPLYKEYS_NONE)
+    {
+        stripped = stripReplyKeys(req->db, buf, len, req->command->reply_keys);
+    }
+    if (stripped != NULL) {
+        addReplyRaw(req->client, stripped, sdslen(stripped), req->id);
+        sdsfree(stripped);
+    } else addReplyRaw(req->client, buf, len, req->id);
+}
+
+/* KEYS: rewrite the pattern so that it only matches keys of the current
+ * database (the reply handler will strip the prefixes). */
+int keysCommand(void *r) {
+    clientRequest *req = r;
+    if (!dbEmulationEnabled() || req->argc != 2)
+        return PROXY_COMMAND_UNHANDLED;
+    sds *args = requestArgsCopy(req);
+    if (args == NULL) {
+        addReplyError(req->client, ERROR_OOM, req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    sds pattern = dbKeyPattern(req->db, args[1], sdslen(args[1]));
+    int ok = (pattern != NULL);
+    if (ok) {
+        sdsfree(args[1]);
+        args[1] = pattern;
+        ok = requestSetArgs(req, args, req->argc);
+    }
+    freeRequestArgs(args, req->argc);
+    if (!ok) {
+        addReplyError(req->client, ERROR_OOM, req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    return PROXY_COMMAND_UNHANDLED;
+}
+
+/* RANDOMKEY: Redis has no way to get a random key matching a pattern, so in
+ * database emulation mode the command is implemented as a SCAN starting from
+ * a random cursor and matching only keys of the current database. The reply
+ * handler (getRandomReply) picks a random key from the returned batch. */
+int randomkeyCommand(void *r) {
+    clientRequest *req = r;
+    client *c = req->client;
+    if (!dbEmulationEnabled()) return PROXY_COMMAND_UNHANDLED;
+    sds *args = zcalloc(sizeof(sds) * 6);
+    if (args == NULL) {
+        addReplyError(c, ERROR_OOM, req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    args[0] = sdsnew("SCAN");
+    /* Start from the beginning of the keyspace: SCAN with a random cursor can
+     * legitimately return no keys at all for small keyspaces, while a large
+     * COUNT makes the first batch representative enough. */
+    args[1] = sdsnew("0");
+    args[2] = sdsnew("COUNT");
+    args[3] = sdscatprintf(sdsempty(), "%d", config.db_scan_count);
+    args[4] = sdsnew("MATCH");
+    args[5] = dbKeyPattern(req->db, "*", 1);
+    int ok = (args[0] && args[1] && args[2] && args[3] && args[4] && args[5]);
+    if (ok) ok = requestSetArgs(req, args, 6);
+    freeRequestArgs(args, 6);
+    if (!ok) {
+        addReplyError(c, ERROR_OOM, req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    /* The keys of a database can be spread over all the master nodes, so
+     * query all of them and pick a random key among all the replies. */
+    if (!duplicateRequestForAllMasters(req)) {
+        addReplyError(c, ERROR_OOM, req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    return PROXY_COMMAND_UNHANDLED;
+}
+
 int selectCommand(void *r) {
     clientRequest *req = r;
     client *c = req->client;
@@ -786,14 +1132,20 @@ int selectCommand(void *r) {
     sds arg = requestArg(req, 1);
     if (req->argc != 2 || arg == NULL) {
         addReplyErrorWrongArgc(c, "select", req->id);
+    } else if (c->multi_transaction) {
+        /* Changing database inside a transaction could split the transaction
+         * across different key prefixes (and therefore different slots). */
+        addReplyError(c, "SELECT is not allowed in MULTI", req->id);
     } else if (!parseIntArg(arg, &db)) {
         addReplyError(c, "value is not an integer or out of range", req->id);
-    } else if (db != 0) {
-        /* Only DB 0 is supported, since a Redis Cluster has a single
-         * database. Returning an error prevents clients from silently
-         * operating on the wrong database. */
+    } else if (db < 0 || db >= config.databases) {
+        addReplyError(c, "DB index is out of range", req->id);
+    } else if (!dbEmulationEnabled() && db != 0) {
+        /* Without database emulation the proxy behaves like a Redis Cluster,
+         * which only has DB 0. */
         addReplyError(c, "SELECT is not allowed in cluster mode", req->id);
     } else {
+        c->db = (int) db;
         addReplyString(c, "OK", req->id);
     }
     if (arg != NULL) sdsfree(arg);
@@ -827,6 +1179,7 @@ int resetCommand(void *r) {
         sdsfree(c->name);
         c->name = NULL;
     }
+    c->db = 0;
     addReplyString(c, "RESET", req->id);
     return PROXY_COMMAND_HANDLED;
 }
@@ -975,7 +1328,7 @@ int clientCommand(void *r) {
     } else if (!strcasecmp(sub, "info")) {
         sds info = sdscatfmt(sdsempty(),
             "id=%U addr=%s laddr=%s fd=%i name=%s age=0 idle=0 flags=N "
-            "db=0 sub=0 psub=0 ssub=0 multi=%i qbuf=0 qbuf-free=0 argv-mem=0 "
+            "db=%i sub=0 psub=0 ssub=0 multi=%i qbuf=0 qbuf-free=0 argv-mem=0 "
             "multi-mem=0 rbs=0 rbp=0 obl=0 oll=0 omem=0 tot-mem=0 events=r "
             "cmd=client|info user=default redir=-1 resp=2 lib-name= lib-ver=",
             (unsigned long long) c->id,
@@ -983,6 +1336,7 @@ int clientCommand(void *r) {
             c->addr ? c->addr : "",
             c->fd,
             c->name ? c->name : "",
+            c->db,
             c->multi_transaction ? -1 : 0);
         addReplyBulkString(c, info, req->id);
         sdsfree(info);
@@ -1190,11 +1544,11 @@ int scanCommand(void *r) {
         addReplyError(c, ERROR_INVALID_QUERY, req->id);
         return PROXY_COMMAND_HANDLED;
     }
-    int status = PROXY_COMMAND_UNHANDLED;
+    int status = PROXY_COMMAND_UNHANDLED, i, new_argc = req->argc;
     sds cursor = sdsnewlen(req->buffer + req->offsets[1], req->lengths[1]);
     char *errptr = NULL;
     uint64_t encoded_cursor = strtoull(cursor, &errptr, 10);
-    uint64_t real_cursor = 0;
+    uint64_t real_cursor = 0, base_cursor = encoded_cursor;
     int idx = 0;
     if (errptr && *errptr != '\0') {
         proxyLogDebug("Invalid SCAN cursor: '%s'. (errptr: '%s')",
@@ -1204,43 +1558,33 @@ int scanCommand(void *r) {
         goto final;
     }
     if (encoded_cursor != 0) {
-        if (encoded_cursor < SCAN_CURSOR_NODE_BASE) {
+        /* When database emulation is enabled the cursor also encodes the
+         * database it belongs to. */
+        if (dbEmulationEnabled()) {
+            int cursor_db = (int) (encoded_cursor %
+                                   (uint64_t) config.databases);
+            base_cursor = encoded_cursor / (uint64_t) config.databases;
+            if (cursor_db != req->db) {
+                addReplyError(c, "invalid cursor", req->id);
+                status = PROXY_COMMAND_HANDLED;
+                goto final;
+            }
+        }
+        if (base_cursor < SCAN_CURSOR_NODE_BASE) {
             /* Compatibility with cursors produced by older proxy versions:
              * transitions to the next node were encoded as 4 digits with
              * leading zeroes, which numeric clients normalized to 1, 2, ... */
-            idx = (int) encoded_cursor;
+            idx = (int) base_cursor;
         } else {
-            idx = (int) (encoded_cursor % SCAN_CURSOR_NODE_BASE);
-            real_cursor = encoded_cursor / SCAN_CURSOR_NODE_BASE - 1;
+            idx = (int) (base_cursor % SCAN_CURSOR_NODE_BASE);
+            real_cursor = base_cursor / SCAN_CURSOR_NODE_BASE - 1;
         }
-        /* Replace the encoded cursor with the real cursor that has to be sent
-         * to the node. */
-        int crslen = sdslen(cursor);
-        sds realstr = sdscatprintf(sdsempty(), "%llu",
-                                   (unsigned long long) real_cursor);
-        char *p = req->buffer + req->offsets[1] + crslen;
-        sds remaining = sdsnew(p);
-        p = req->buffer + req->offsets[1];
-        while (p > req->buffer && *p != '$') p--;
-        if (p <= req->buffer) {
-            addReplyError(c, ERROR_INVALID_QUERY, req->id);
-            sdsfree(realstr);
-            sdsfree(remaining);
-            status = PROXY_COMMAND_HANDLED;
-            goto final;
-        }
-        sdsrange(req->buffer, 0, p - req->buffer);
-        req->buffer = sdscatfmt(req->buffer, "%u\r\n%S%S",
-                                (unsigned int) sdslen(realstr),
-                                realstr, remaining);
-        sdsfree(realstr);
-        sdsfree(remaining);
     }
     redisCluster *cluster = getCluster(c);
     list *node_names = clusterGetMasterNames(cluster);
     if (!node_names) goto final;
     /* If the index is beyond the current nodes, use the last node. */
-    if ((unsigned long)idx >= listLength(node_names))
+    if ((unsigned long) idx >= listLength(node_names))
         idx = listLength(node_names) - 1;
     listNode *ln = listIndex(node_names, (long) idx);
     clusterNode *node = NULL;
@@ -1250,6 +1594,42 @@ int scanCommand(void *r) {
     }
     if (!node) {
         addReplyError(c, ERROR_NO_NODE, req->id);
+        status = PROXY_COMMAND_HANDLED;
+        goto final;
+    }
+    /* Rebuild the query with the real cursor and, when database emulation is
+     * enabled, with the MATCH pattern rewritten so that it only matches keys
+     * of the current database. */
+    sds *args = requestArgsCopy(req);
+    if (args == NULL) {
+        addReplyError(c, ERROR_OOM, req->id);
+        status = PROXY_COMMAND_HANDLED;
+        goto final;
+    }
+    sdsfree(args[1]);
+    args[1] = sdscatprintf(sdsempty(), "%llu",
+                           (unsigned long long) real_cursor);
+    int match_idx = -1;
+    for (i = 2; i < req->argc; i++) {
+        if (strcasecmp(args[i], "match") == 0) match_idx = i;
+    }
+    if (dbEmulationEnabled()) {
+        if (match_idx >= 0 && match_idx + 1 < req->argc) {
+            sds pattern = dbKeyPattern(req->db, args[match_idx + 1],
+                                       sdslen(args[match_idx + 1]));
+            sdsfree(args[match_idx + 1]);
+            args[match_idx + 1] = pattern;
+        } else if (match_idx < 0) {
+            args = zrealloc(args, (req->argc + 2) * sizeof(sds));
+            args[req->argc] = sdsnew("MATCH");
+            args[req->argc + 1] = dbKeyPattern(req->db, "*", 1);
+            new_argc = req->argc + 2;
+        }
+    }
+    int ok = requestSetArgs(req, args, new_argc);
+    freeRequestArgs(args, new_argc);
+    if (!ok) {
+        addReplyError(c, ERROR_OOM, req->id);
         status = PROXY_COMMAND_HANDLED;
         goto final;
     }
@@ -1610,7 +1990,7 @@ final:
         proxyLogDebug("%s", err);
     } else {
         reply = sdscatfmt(sdsempty(), "*%u\r\n%S", count, merged_replies);
-        addReplyRaw(req->client, reply, sdslen(reply), req->id);
+        addReplyWithStrippedKeys(req, reply, sdslen(reply));
     }
     if (reply) sdsfree(reply);
     sdsfree(merged_replies);
@@ -1650,12 +2030,81 @@ int getFirstMultipleReply(void *_reply, void *_req, char *buf, int len) {
     return 1;
 }
 
+/* Sample a random key from a SCAN reply, using reservoir sampling across
+ * multiple replies (child replies of the different master nodes). */
+static void scanReplySampleKey(clientRequest *req, const char *buf, size_t len,
+                               unsigned long long *count, sds *selected) {
+    size_t buflen = len, pos;
+    if (len == 0 || buf == NULL || buf[0] != '*') return;
+    const char *nl = memchr(buf, '\n', buflen);
+    if (nl == NULL) return;
+    pos = (size_t) (nl - buf) + 1;
+    pos = respObjectEnd(buf, buflen, pos); /* Skip the cursor. */
+    if (pos == 0 || pos >= buflen || buf[pos] != '*') return;
+    nl = memchr(buf + pos, '\n', buflen - pos);
+    if (nl == NULL) return;
+    long n = strtol(buf + pos + 1, NULL, 10);
+    size_t p = (size_t) (nl - buf) + 1;
+    long i;
+    for (i = 0; i < n; i++) {
+        if (p >= buflen || buf[p] != '$') return;
+        nl = memchr(buf + p, '\n', buflen - p);
+        if (nl == NULL) return;
+        long klen = strtol(buf + p + 1, NULL, 10);
+        size_t data = (size_t) (nl - buf) + 1;
+        if (klen < 0 || data + (size_t) klen + 2 > buflen) return;
+        (*count)++;
+        if ((random() % *count) == 0) {
+            sds key = dbStripKey(req->db, buf + data, (size_t) klen);
+            if (key != NULL) {
+                if (*selected != NULL) sdsfree(*selected);
+                *selected = key;
+            }
+        }
+        p = data + (size_t) klen + 2;
+    }
+}
+
 int getRandomReply(void *_reply, void *_req, char *buf, int len) {
     UNUSED(_reply);
-    UNUSED(buf);
-    UNUSED(len);
     clientRequest *req = _req;
+    if (dbEmulationEnabled()) {
+        /* In database emulation mode RANDOMKEY is implemented as a SCAN with
+         * a random starting cursor and a MATCH pattern for the current
+         * database, sent to all the master nodes (see randomkeyCommand): pick
+         * a random key from all the returned batches. */
+        unsigned long long count = 0;
+        sds selected = NULL;
+        if (req->child_replies != NULL) {
+            raxIterator iter;
+            raxStart(&iter, req->child_replies);
+            if (raxSeek(&iter, "^", NULL, 0)) {
+                while (raxNext(&iter)) {
+                    sds child_reply = (sds) iter.data;
+                    if (child_reply == NULL || child_reply[0] == '-')
+                        continue;
+                    scanReplySampleKey(req, child_reply, sdslen(child_reply),
+                                       &count, &selected);
+                }
+            }
+            raxStop(&iter);
+        } else if (buf != NULL && len > 0) {
+            scanReplySampleKey(req, buf, (size_t) len, &count, &selected);
+        }
+        if (selected == NULL) addReplyNull(req->client, req->id);
+        else {
+            addReplyBulkStringLen(req->client, selected, sdslen(selected),
+                                  req->id);
+            sdsfree(selected);
+        }
+        return 1;
+    }
     raxIterator iter;
+    if (req->child_replies == NULL) {
+        /* Single reply (eg. inside a MULTI transaction). */
+        addReplyRaw(req->client, buf, len, req->id);
+        return 1;
+    }
     raxStart(&iter, req->child_replies);
     sds selected = NULL;
     unsigned long long count = 0;
@@ -1814,15 +2263,26 @@ int handleScanReply(void *_reply, void *_req, char *buf, int len) {
         err = ERROR_INVALID_REPLY;
         goto final;
     }
-    uint64_t encoded_cursor = (cursor_n + 1) * SCAN_CURSOR_NODE_BASE +
-                              (uint64_t) idx;
+    uint64_t base_cursor = (cursor_n + 1) * SCAN_CURSOR_NODE_BASE +
+                           (uint64_t) idx;
+    uint64_t encoded_cursor = base_cursor;
+    if (dbEmulationEnabled()) {
+        if (base_cursor > (UINT64_MAX - (uint64_t) req->db) /
+                         (uint64_t) config.databases)
+        {
+            err = ERROR_INVALID_REPLY;
+            goto final;
+        }
+        encoded_cursor = base_cursor * (uint64_t) config.databases +
+                         (uint64_t) req->db;
+    }
     sdsfree(cursor);
     cursor = sdscatprintf(sdsempty(), "%llu",
                           (unsigned long long) encoded_cursor);
     remaining = sdsnewlen(p, len - (p - buffer));
     sdsrange(buffer, 0, (lenptr - 1) - buffer);
     buffer = sdscatfmt(buffer, "%u\r\n%S%S", sdslen(cursor), cursor, remaining);
-    addReplyRaw(c, buffer, sdslen(buffer), req->id);
+    addReplyWithStrippedKeys(req, buffer, sdslen(buffer));
     status = 1;
 final:
     sdsfree(buffer);
@@ -4089,6 +4549,9 @@ static int duplicateRequestForAllMasters(clientRequest *req) {
             child->node = node;
             child->command = req->command;
             child->parsing_status = req->parsing_status;
+            child->db = req->db;
+            child->db_set = 1;
+            child->keys_prefixed = 1;
             listAddNodeHead(req->child_requests, child);
         }
     }
@@ -4184,6 +4647,9 @@ static int splitMultiSlotRequest(clientRequest *req, int idx) {
     new->buffer = sdscat(new->buffer, newbuf);
     new->command = req->command;
     new->parent_request = parent;
+    new->db = req->db;
+    new->db_set = 1;
+    new->keys_prefixed = 1;
     sdsfree(newbuf);
     newbuf = NULL;
     if (!getRequestNode(new, NULL)) {
@@ -4742,6 +5208,14 @@ int processRequest(clientRequest *req, int *parsing_status,
         proxyLogDebug("Parsing complete for request " REQID_PRINTF_FMT,
             REQID_PRINTF_ARG(req));
     }
+    /* Remember the database the request was issued in: the client may issue a
+     * SELECT while the request is being processed (eg. in a pipeline) or the
+     * request may be re-processed after a cluster reconfiguration. */
+    if (!req->db_set) {
+        req->db = (req->parent_request != NULL) ?
+                  req->parent_request->db : c->db;
+        req->db_set = 1;
+    }
     if (next != NULL && req->requests_lnode != NULL) {
         listNode *next_node = listNextNode(req->requests_lnode);
         /* Child requests (created by multiple-replies or cross-slot commands)
@@ -4813,6 +5287,11 @@ int processRequest(clientRequest *req, int *parsing_status,
         clusterAddRequestToReprocess(cluster, req);
         if (command_name) sdsfree(command_name);
         return 1;
+    }
+    if (!prefixRequestKeys(req, &errmsg)) {
+        if (errmsg == NULL) errmsg = sdsnew(ERROR_INVALID_QUERY);
+        proxyLogDebug("%s " REQID_PRINTF_FMT, errmsg, REQID_PRINTF_ARG(req));
+        goto invalid_request;
     }
     clusterNode *node = getRequestNode(req, &errmsg);
     if (node == NULL) {
@@ -5281,7 +5760,7 @@ static int processClusterReplyBuffer(redisContext *ctx, clusterNode *node,
                         goto consume_buffer;
                     }
                 }
-                addReplyRaw(req->client, obuf, len, req->id);
+                addReplyWithStrippedKeys(req, obuf, len);
             }
         }
         if (req->closes_transaction) {

@@ -78,8 +78,15 @@ test "EVAL does not treat ARGV as a key" do
         reply = client.eval("return ARGV[1]", ["compat:evalkey"],
                             ["compat:argv"])
         assert_equal(reply, "compat:argv")
-        reply = client.eval("return KEYS[1]", ["compat:evalkey"])
-        assert_equal(reply, "compat:evalkey")
+        # Keys are prefixed by database emulation, so scripts must use
+        # KEYS[i] (never build key names from ARGV).
+        reply = client.eval(
+            "redis.call('SET', KEYS[1], 'v') " \
+            "return redis.call('GET', KEYS[1])",
+            ["compat:evalkey"])
+        assert_equal(reply, "v")
+        reply = client.get "compat:evalkey"
+        assert_equal(reply, "v")
         # No keys, only ARGV: must not be treated as a key for routing.
         reply = client.eval("return ARGV[1]", [], ["compat:argv"])
         assert_equal(reply, "compat:argv")
@@ -165,11 +172,16 @@ test "CLIENT SETNAME/GETNAME/ID" do
     sock.close
 end
 
-test "SELECT: db 0 is accepted, other DBs are rejected" do
+test "SELECT: database emulation" do
     assert_equal(compat_raw_command("SELECT", "0"), "+OK")
-    reply = compat_raw_command("SELECT", "1")
-    assert_match(reply, /SELECT is not allowed in cluster mode/,
+    assert_equal(compat_raw_command("SELECT", "1"), "+OK")
+    reply = compat_raw_command("SELECT", "16")
+    assert_match(reply, /DB index is out of range/,
                  "Unexpected SELECT reply: #{reply}")
+    reply = compat_raw_command("SELECT", "abc")
+    assert_match(reply, /value is not an integer or out of range/,
+                 "Unexpected SELECT reply: #{reply}")
+    assert_equal(compat_raw_command("SELECT", "0"), "+OK")
 end
 
 test "INFO contains real node info and proxy sections" do

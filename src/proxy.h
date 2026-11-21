@@ -95,6 +95,10 @@ typedef struct clientRequest {
     int ask_retries;
     int force_node;
     int duplicated;
+    /* Database the request was issued in (see database emulation). */
+    int db;
+    int db_set;
+    int keys_prefixed;
     list *child_requests;
     rax  *child_replies;
     struct clientRequest *parent_request;
@@ -135,6 +139,7 @@ typedef struct client {
     int port;
     sds addr;
     sds name;                      /* Client name (CLIENT SETNAME) */
+    int db;                        /* Selected database */
     int thread_id;
     sds obuf;
     size_t written;
