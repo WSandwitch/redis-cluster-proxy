@@ -1,0 +1,23 @@
+# Keep the build context free of artifacts produced by a local build.
+#
+# Without this file, `COPY . redis-cluster-proxy` copies the object files and
+# the binary compiled for the build host. In a multi-platform buildx build
+# `make` sees them as up to date and tries to link them for the target
+# platform, which fails with:
+#
+#   ld: adlist.o: Relocations in generic ELF (EM: 183)
+#   ld: adlist.o: error adding symbols: file in wrong format
+#
+# (183 is EM_AARCH64). The `.git` directory is intentionally kept: the build
+# uses it to stamp the commit/branch reported by `PROXY INFO`.
+**/*.o
+**/*.a
+**/redis-cluster-proxy
+**/.make-*
+**/Makefile.dep
+**/*.dSYM
+src/release.h
+release.h
+release
+test/tmp
+.DS_Store
