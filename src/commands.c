@@ -47,6 +47,7 @@ int flushdbReply(void *reply, void *req, char *buf, int len);
 int moveCommand(void *req);
 int copyCommand(void *req);
 int swapdbCommand(void *req);
+int swapdbReply(void *reply, void *req, char *buf, int len);
 int sortCommand(void *req);
 int memoryCommand(void *req);
 int georadiusGetKeys(void *r, int *first_key, int *last_key, int *key_step,
@@ -211,7 +212,9 @@ struct redisCommandDef redisCommandTable[245] = {
     {"zremrangebyrank", 4, 1, 1, 1, 0, 0, NULL, NULL, NULL},
     {"publish", 3, 0, 0, 0, 0, 1, NULL, NULL, NULL},
     {"zrevrangebyscore", -4, 1, 1, 1, 0, 0, NULL, NULL, NULL},
-    {"swapdb", 3, 0, 0, 0, 0, 0, NULL, swapdbCommand, NULL},
+    {"swapdb", 3, 0, 0, 0,
+     CMDFLAG_HANDLE_REPLY,
+     0, NULL, swapdbCommand, swapdbReply},
     {"latency", -2, 0, 0, 0, 0, 1, NULL, NULL, NULL},
     {"zscore", 3, 1, 1, 1, 0, 0, NULL, NULL, NULL},
     {"lset", 4, 1, 1, 1, 0, 0, NULL, NULL, NULL},

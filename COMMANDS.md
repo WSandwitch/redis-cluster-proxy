@@ -164,7 +164,7 @@ Those commands are supported by Redis Cluster Proxy.
  - SUBSTR
  - SUNION
  - SUNIONSTORE (**cross-slots unsupported**)
- - SWAPDB (**not supported when database emulation is enabled**)
+ - SWAPDB (**SCAN-based and non-atomic when database emulation is enabled**)
  - TIME
  - TOUCH (**sums multiple replies**)
  - TTL

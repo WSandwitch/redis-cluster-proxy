@@ -1455,6 +1455,13 @@ static int requestIsCrossSlotWrite(clientRequest *req) {
 
 #define DB_SCAN_STATE_SCAN      1
 #define DB_SCAN_STATE_UNLINK    2
+#define DB_SCAN_STATE_RENAME    3
+
+/* Number of temporary databases available to SWAPDB, starting at
+ * config.databases + 1. Clients can only SELECT the databases in
+ * [0, config.databases), so the temporary ones are invisible to them; any
+ * leftover key is removed when the proxy starts. */
+#define DB_SWAP_TEMP_COUNT      16
 
 /* Return the master node with the given index in the alphabetically sorted
  * list of master names, or NULL if the index is out of range. */
@@ -1483,7 +1490,7 @@ static int dbScanPrepare(clientRequest *req) {
     args[2] = sdsnew("COUNT");
     args[3] = sdscatprintf(sdsempty(), "%d", config.db_scan_count);
     args[4] = sdsnew("MATCH");
-    args[5] = dbKeyPattern(req->db, "*", 1);
+    args[5] = dbKeyPattern(req->db_scan_db, "*", 1);
     int ok = (args[0] && args[1] && args[2] && args[3] && args[4] && args[5]);
     if (ok) ok = requestSetArgs(req, args, 6);
     freeRequestArgs(args, 6);
@@ -1616,6 +1623,7 @@ int dbsizeCommand(void *r) {
     req->db_scan_node = 0;
     req->db_scan_cursor = 0;
     req->db_scan_total = 0;
+    req->db_scan_db = req->db;
     if (!dbScanPrepare(req)) {
         addReplyError(req->client, ERROR_OOM, req->id);
         return PROXY_COMMAND_HANDLED;
@@ -1684,6 +1692,7 @@ int flushdbCommand(void *r) {
     req->db_scan_node = 0;
     req->db_scan_cursor = 0;
     req->db_scan_total = 0;
+    req->db_scan_db = req->db;
     if (!dbScanPrepare(req)) {
         addReplyError(req->client, ERROR_OOM, req->id);
         return PROXY_COMMAND_HANDLED;
@@ -1761,12 +1770,251 @@ next_node:
     return 1;
 }
 
+/* Return a copy of the physical `key` of database `src` (length `len`) with
+ * its database prefix replaced by the prefix of database `dst`.
+ *
+ * The rest of the key (including the hash tag) is preserved, so the new key
+ * belongs to the same cluster slot and therefore lives on the same node: the
+ * RENAME can be executed locally by that node. */
+static sds dbRetargetKey(int src, int dst, const char *key, size_t len) {
+    sds src_prefix = dbNumberPrefix(src);
+    if (src_prefix == NULL) return NULL;
+    sds dst_prefix = dbNumberPrefix(dst);
+    if (dst_prefix == NULL) {
+        sdsfree(src_prefix);
+        return NULL;
+    }
+    size_t plen = sdslen(src_prefix);
+    sds out = NULL;
+    if (len >= plen && memcmp(key, src_prefix, plen) == 0) {
+        out = sdsdup(dst_prefix);
+        if (out != NULL) out = sdscatlen(out, key + plen, len - plen);
+    }
+    sdsfree(src_prefix);
+    sdsfree(dst_prefix);
+    return out;
+}
+
+/* Set the source and destination databases of the current SWAPDB phase:
+ *   0: a -> temporary
+ *   1: b -> a
+ *   2: temporary -> b
+ */
+static void dbSwapPhaseDbs(clientRequest *req, int *src, int *dst) {
+    switch (req->swapdb_phase) {
+    case 0:
+        *src = req->swapdb_a;
+        *dst = req->swapdb_temp;
+        break;
+    case 1:
+        *src = req->swapdb_b;
+        *dst = req->swapdb_a;
+        break;
+    default:
+        *src = req->swapdb_temp;
+        *dst = req->swapdb_b;
+        break;
+    }
+}
+
+/* Prepare the SCAN query for the source database of the current SWAPDB
+ * phase. */
+static int dbSwapScanPrepare(clientRequest *req) {
+    int src, dst;
+    if (req->swapdb_phase < 0 || req->swapdb_phase > 2) return 0;
+    dbSwapPhaseDbs(req, &src, &dst);
+    UNUSED(dst);
+    req->db_scan_db = src;
+    return dbScanPrepare(req);
+}
+
+/* Prepare a RENAME batch moving the physical keys `keys` from the source to
+ * the destination database of the current SWAPDB phase.
+ *
+ * As with dbUnlinkPrepare(), the keys are passed as ARGV of a Lua script:
+ * a SCAN batch can span multiple slots, and keys already moved (SCAN may
+ * return a key more than once) must be skipped instead of making RENAME
+ * fail. RENAME overwrites the destination when it already exists, like the
+ * real SWAPDB does. */
+static int dbRenamePrepare(clientRequest *req, sds *keys, int nkeys) {
+    static const char *rename_script =
+        "local n = 0\n"
+        "for i = 1, #ARGV, 2 do\n"
+        "  if redis.call('EXISTS', ARGV[i]) == 1 then\n"
+        "    redis.call('RENAME', ARGV[i], ARGV[i + 1])\n"
+        "    n = n + 1\n"
+        "  end\n"
+        "end\n"
+        "return n";
+    int src, dst, i;
+    dbSwapPhaseDbs(req, &src, &dst);
+    sds *args = zcalloc(sizeof(sds) * (nkeys * 2 + 3));
+    if (args == NULL) return 0;
+    args[0] = sdsnew("EVAL");
+    args[1] = sdsnew(rename_script);
+    args[2] = sdsnew("0");
+    int ok = (args[0] && args[1] && args[2]);
+    for (i = 0; ok && i < nkeys; i++) {
+        args[i * 2 + 3] = sdsdup(keys[i]);
+        args[i * 2 + 4] = dbRetargetKey(src, dst, keys[i], sdslen(keys[i]));
+        if (args[i * 2 + 3] == NULL || args[i * 2 + 4] == NULL) ok = 0;
+    }
+    if (ok) ok = requestSetArgs(req, args, nkeys * 2 + 3);
+    freeRequestArgs(args, nkeys * 2 + 3);
+    if (!ok) return 0;
+    req->keys_prefixed = 1;
+    req->written = 0;
+    return 1;
+}
+
+/* Sequence used together with random() to choose the temporary database of a
+ * SWAPDB request: unlike random() alone, it guarantees that concurrent SWAPDB
+ * requests use different temporary databases (as long as fewer than
+ * DB_SWAP_TEMP_COUNT swaps run at the same time). */
+static unsigned long swapdb_temp_seq = 0;
+
+/* Reply with an error for a failed SWAPDB and release the cross-slot lock. */
+static void swapdbFail(clientRequest *req) {
+    if (req->lock_acquired) lockReleaseHolder(req);
+    addReplyError(req->client, ERROR_OOM, req->id);
+    freeRequest(req);
+}
+
 int swapdbCommand(void *r) {
     clientRequest *req = r;
+    client *c = req->client;
+    long long db_a = 0, db_b = 0;
     if (!dbEmulationEnabled()) return PROXY_COMMAND_UNHANDLED;
-    addReplyError(req->client, "SWAPDB is not supported when database "
-                  "emulation is enabled", req->id);
-    return PROXY_COMMAND_HANDLED;
+    if (c->multi_transaction) {
+        addReplyError(c, "SWAPDB is not supported inside MULTI when "
+                      "database emulation is enabled", req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    sds arg = requestArg(req, 1);
+    if (arg == NULL || !parseIntArg(arg, &db_a)) {
+        if (arg != NULL) sdsfree(arg);
+        addReplyError(c, "value is not an integer or out of range", req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    sdsfree(arg);
+    arg = requestArg(req, 2);
+    if (arg == NULL || !parseIntArg(arg, &db_b)) {
+        if (arg != NULL) sdsfree(arg);
+        addReplyError(c, "value is not an integer or out of range", req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    sdsfree(arg);
+    if (db_a < 0 || db_a >= config.databases ||
+        db_b < 0 || db_b >= config.databases)
+    {
+        addReplyError(c, "DB index is out of range", req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    if (db_a == db_b) {
+        /* Swapping a database with itself is a no-op. */
+        addReplyString(c, "OK", req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    req->swapdb_a = (int) db_a;
+    req->swapdb_b = (int) db_b;
+    /* Pick a temporary database outside the range that clients can SELECT.
+     * The random offset is combined with a process-wide sequence so that
+     * concurrent SWAPDB requests do not share the same temporary database.
+     * Leftovers from a crash are removed at startup. */
+    unsigned long seq = __sync_fetch_and_add(&swapdb_temp_seq, 1);
+    req->swapdb_temp = config.databases + 1 +
+                       (int) ((random() + seq) % DB_SWAP_TEMP_COUNT);
+    req->swapdb_phase = 0;
+    req->db_scan_state = DB_SCAN_STATE_SCAN;
+    req->db_scan_node = 0;
+    req->db_scan_cursor = 0;
+    req->db_scan_total = 0;
+    if (config.cross_slot_write_policy == CFG_CROSS_SLOT_POLICY_LOCK)
+        req->lock_whole_command = 1;
+    if (!dbSwapScanPrepare(req)) {
+        addReplyError(c, ERROR_OOM, req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    return PROXY_COMMAND_UNHANDLED;
+}
+
+/* SWAPDB is implemented as a slow, non-atomic SCAN + RENAME over the whole
+ * keyspace of the two databases:
+ *
+ *   1. move every key of database `a` to the temporary database `T`;
+ *   2. move every key of database `b` to database `a`;
+ *   3. move every key of `T` to database `b`;
+ *
+ * The cluster slot of a key is preserved by the database prefix (see dbkey.c),
+ * so every RENAME is a single-slot operation and can run where the key
+ * already is. Clients must not access the two databases while the swap is in
+ * progress; a failure in the middle leaves them partially swapped. */
+int swapdbReply(void *_reply, void *_req, char *buf, int len) {
+    clientRequest *req = _req;
+    uint64_t cursor = 0;
+    sds *keys = NULL;
+    int nkeys = 0, i;
+    if (!dbEmulationEnabled()) return PROXY_REPLY_UNHANDLED;
+    if (buf != NULL && len > 0 && buf[0] == '-') {
+        if (req->lock_acquired) lockReleaseHolder(req);
+        addReplyRaw(req->client, buf, len, req->id);
+        freeRequest(req);
+        return 1;
+    }
+    if (req->db_scan_state == DB_SCAN_STATE_RENAME) {
+        /* A RENAME batch has been executed: resume scanning the same node. */
+        req->db_scan_state = DB_SCAN_STATE_SCAN;
+        if (req->db_scan_cursor != 0) {
+            if (!dbSwapScanPrepare(req) || !dbScanEnqueue(req))
+                swapdbFail(req);
+            return 1;
+        }
+        goto next_node;
+    }
+    if (!dbScanParseReply(buf, len, &cursor, &keys, &nkeys)) {
+        if (req->lock_acquired) lockReleaseHolder(req);
+        addReplyError(req->client, ERROR_INVALID_REPLY, req->id);
+        freeRequest(req);
+        return 1;
+    }
+    req->db_scan_cursor = cursor;
+    if (nkeys > 0) {
+        int ok = dbRenamePrepare(req, keys, nkeys);
+        for (i = 0; i < nkeys; i++) sdsfree(keys[i]);
+        zfree(keys);
+        if (!ok) {
+            swapdbFail(req);
+            return 1;
+        }
+        req->db_scan_state = DB_SCAN_STATE_RENAME;
+        if (!dbScanEnqueue(req)) swapdbFail(req);
+        return 1;
+    }
+    if (keys != NULL) zfree(keys);
+    if (cursor != 0) {
+        if (!dbSwapScanPrepare(req) || !dbScanEnqueue(req)) swapdbFail(req);
+        return 1;
+    }
+next_node:
+    req->db_scan_node++;
+    req->db_scan_cursor = 0;
+    if (dbMasterNodeByIndex(req, req->db_scan_node) != NULL) {
+        if (!dbSwapScanPrepare(req) || !dbScanEnqueue(req)) swapdbFail(req);
+        return 1;
+    }
+    /* The source database has been fully moved: go on with the next phase. */
+    req->swapdb_phase++;
+    if (req->swapdb_phase < 3) {
+        req->db_scan_state = DB_SCAN_STATE_SCAN;
+        req->db_scan_node = 0;
+        req->db_scan_cursor = 0;
+        if (!dbSwapScanPrepare(req) || !dbScanEnqueue(req)) swapdbFail(req);
+        return 1;
+    }
+    if (req->lock_acquired) lockReleaseHolder(req);
+    addReplyString(req->client, "OK", req->id);
+    freeRequest(req);
+    return 1;
 }
 
 /* MOVE key db: the physical keys of the same logical key in different
@@ -4264,6 +4512,115 @@ finished:
     return AE_NOMORE;
 }
 
+/* Remove the keys left in the temporary databases used by SWAPDB (for
+ * example after a crash in the middle of a swap). The temporary databases are
+ * outside the range that clients can SELECT, so their keys were invisible;
+ * they are removed once at startup, before the proxy starts serving clients.
+ *
+ * Failures are not fatal: leftovers stay invisible and will be removed by the
+ * next startup. */
+static void dbCleanupTempDatabases(redisCluster *cluster) {
+    list *names;
+    listIter li;
+    listNode *ln;
+    long long total = 0;
+    int db;
+    if (!dbEmulationEnabled()) return;
+    names = clusterGetMasterNames(cluster);
+    if (names == NULL) return;
+    proxyLogInfo("Cleaning up SWAPDB temporary databases...");
+    listRewind(names, &li);
+    while ((ln = listNext(&li))) {
+        sds name = listNodeValue(ln);
+        clusterNode *node = (name != NULL) ? getNodeByName(cluster, name) :
+                                             NULL;
+        redisContext *ctx;
+        int ok = 1;
+        if (node == NULL || node->ip == NULL || node->port == 0) continue;
+        ctx = redisConnect(node->ip, node->port);
+        if (ctx == NULL || ctx->err) {
+            proxyLogWarn("Failed to connect to %s:%d to clean up SWAPDB "
+                         "temporary databases%s%s", node->ip, node->port,
+                         (ctx != NULL && ctx->errstr[0] != '\0') ? ": " : "",
+                         (ctx != NULL) ? ctx->errstr : "");
+            if (ctx != NULL) redisFree(ctx);
+            continue;
+        }
+        if (config.auth != NULL || config.auth_user != NULL) {
+            redisReply *auth_reply = (config.auth_user != NULL) ?
+                redisCommand(ctx, "AUTH %s %s", config.auth_user,
+                             config.auth) :
+                redisCommand(ctx, "AUTH %s", config.auth);
+            if (auth_reply == NULL || auth_reply->type == REDIS_REPLY_ERROR) {
+                proxyLogWarn("Failed to authenticate to %s:%d to clean up "
+                             "SWAPDB temporary databases", node->ip,
+                             node->port);
+                ok = 0;
+            }
+            if (auth_reply != NULL) freeReplyObject(auth_reply);
+        }
+        /* The temporary range depends on `databases`: if the configured number
+         * of databases was reduced since the leftovers were created, older
+         * temporary databases are not scanned (their keys stay invisible and
+         * harmless). */
+        for (db = config.databases + 1;
+             ok && db <= config.databases + DB_SWAP_TEMP_COUNT; db++)
+        {
+            sds pattern = dbKeyPattern(db, "*", 1);
+            char cursor[32] = "0";
+            if (pattern == NULL) {
+                ok = 0;
+                break;
+            }
+            while (ok) {
+                redisReply *reply = redisCommand(ctx,
+                    "SCAN %s MATCH %b COUNT %d", cursor, pattern,
+                    (size_t) sdslen(pattern), config.db_scan_count);
+                redisReply *keys;
+                size_t k;
+                if (reply == NULL || reply->type != REDIS_REPLY_ARRAY ||
+                    reply->elements != 2)
+                {
+                    if (reply != NULL) freeReplyObject(reply);
+                    ok = 0;
+                    break;
+                }
+                keys = reply->element[1];
+                if (keys != NULL && keys->type == REDIS_REPLY_ARRAY) {
+                    for (k = 0; k < keys->elements; k++) {
+                        redisReply *key = keys->element[k];
+                        redisReply *del;
+                        if (key == NULL || key->type != REDIS_REPLY_STRING)
+                            continue;
+                        del = redisCommand(ctx, "DEL %b", key->str, key->len);
+                        if (del != NULL) freeReplyObject(del);
+                        total++;
+                    }
+                }
+                redisReply *next = reply->element[0];
+                if (next == NULL || next->type != REDIS_REPLY_STRING) {
+                    freeReplyObject(reply);
+                    ok = 0;
+                    break;
+                }
+                snprintf(cursor, sizeof(cursor), "%s", next->str);
+                int done = (strcmp(cursor, "0") == 0);
+                freeReplyObject(reply);
+                if (done) break;
+            }
+            sdsfree(pattern);
+        }
+        if (!ok)
+            proxyLogWarn("Failed to clean up SWAPDB temporary databases on "
+                        "%s:%d", node->ip, node->port);
+        redisFree(ctx);
+    }
+    if (total > 0) {
+        proxyLogWarn("Removed %lld leftover key(s) from SWAPDB temporary "
+                     "databases", total);
+    } else proxyLogDebug("No leftover keys in SWAPDB temporary databases");
+}
+
 static proxyThread *createProxyThread(int index) {
     int is_first = (index == 0);
     proxyThread *thread = zcalloc(sizeof(*thread));
@@ -4302,6 +4659,7 @@ static proxyThread *createProxyThread(int index) {
     }
     if (is_first) {
         printClusterConfiguration(thread->cluster);
+        dbCleanupTempDatabases(thread->cluster);
         int nodecount = thread->cluster->masters_count +
                         thread->cluster->replicas_count;
         int poolsize = config.connections_pool.size;

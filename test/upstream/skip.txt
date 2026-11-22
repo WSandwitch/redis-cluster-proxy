@@ -28,9 +28,6 @@
 BLPOP inside a transaction
 BLMPOP_LEFT inside a transaction
 
-# SWAPDB is not supported when database emulation is enabled (explicit error).
-SWAPDB awakes blocked client
-
 # CLIENT UNBLOCK cannot work: blocking commands run on private connections
 # with node-side client IDs that are unknown to the proxy's clients.
 client unblock tests

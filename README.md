@@ -235,9 +235,11 @@ db-prefix "%d/"
 - `RESET` goes back to database 0, `CLIENT INFO` reports the selected database.
 - The prefix is applied to **all** databases, including DB 0 (`0/foo`), so that no key is visible from two databases.
 - `KEYS`, `SCAN` (including its `MATCH` option), `RANDOMKEY`, `DBSIZE`, `FLUSHDB`, `MOVE`, `COPY ... DB` and the blocking/pop/stream commands are database-aware.
-- `DBSIZE` and `FLUSHDB` are implemented with `SCAN` and are therefore O(N); their `COUNT` can be tuned with `--db-scan-count`.
+- `DBSIZE`, `FLUSHDB` and `SWAPDB` are implemented with `SCAN` and are therefore O(N); their `COUNT` can be tuned with `--db-scan-count`.
 - `SCAN` cursors encode the database they belong to: reusing a cursor in another database replies with `invalid cursor`.
-- `SWAPDB` is not supported.
+- `SWAPDB` swaps the two databases one key at a time (`SCAN` + `RENAME`) and is therefore **not atomic**: clients must not access the two databases while it is running, and a failure in the middle leaves them partially swapped. To avoid collisions, the keys are moved through a temporary database outside the range that clients can `SELECT`; keys left there by a crash are removed the next time the proxy starts (provided `databases` and `db-prefix` are unchanged).
+- `SWAPDB` does not touch keys watched with `WATCH`: since it only renames the keys that actually exist, a transaction watching a key that exists in neither of the two databases is not invalidated (the real command invalidates it).
+- Concurrent `SWAPDB` commands are not supported: like any other access to the two databases during a swap, they must be serialized by the client.
 - `INFO keyspace` is omitted, since all the emulated databases share the cluster's DB 0; use `DBSIZE` instead.
 - `COPY src dst DB n` is allowed only if the two keys hash to the same slot (which is always the case when `src == dst`), otherwise it replies with `CROSSSLOT`.
 
@@ -388,6 +390,9 @@ The `PROXY` command will allow you to get specific info or perform actions that 
 - DBSIZE: sends the query to all nodes in the cluster and sums their replies,
           so that the result will be the total number of keys in the whole
           cluster.
+- SWAPDB: when database emulation is enabled it is implemented with `SCAN` +
+          `RENAME`, so it is slow and not atomic (see "Database emulation"
+          below).
 - SCAN: performs the scan on all the master nodes of the cluster. The cursor returned to the client encodes both the real Redis cursor and the index of the node that has to be scanned next, as `(real_cursor + 1) * 10000 + node_index`. Cursors are plain decimal numbers, so clients can safely convert them to integers. The final cursor (when the scan is complete) is `0`.
 - INFO: collected from all the master nodes. Counter fields that span the whole cluster (currently `blocked_clients` and `rdb_changes_since_last_save`) are summed, so that the proxy behaves like a single instance.
 - MEMORY: `MEMORY USAGE <key>` is routed to the node owning the key (the key is prefixed when database emulation is enabled); the other subcommands are executed on the first master.

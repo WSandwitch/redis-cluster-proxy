@@ -108,12 +108,18 @@ typedef struct clientRequest {
     int db_set;
     int keys_prefixed;
     /* State used by commands that iterate the keyspace of a database
-     * (DBSIZE, FLUSHDB). */
+     * (DBSIZE, FLUSHDB, SWAPDB). */
     int db_scan_state;
     int db_scan_node;
     uint64_t db_scan_cursor;
     long long db_scan_total;
     int db_scan_async;
+    int db_scan_db;           /* database currently being scanned */
+    /* State used by the SCAN-based SWAPDB implementation. */
+    int swapdb_phase;         /* 0: a->T, 1: b->a, 2: T->b */
+    int swapdb_a;
+    int swapdb_b;
+    int swapdb_temp;          /* temporary database used by the swap */
     int handler_done;
     int lock_acquired;
     int lock_queued;

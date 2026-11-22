@@ -174,14 +174,103 @@ test "COPY supports the DB option for same-slot keys" do
     }
 end
 
-test "SWAPDB returns an explicit error" do
+test "SWAPDB exchanges the keys of two databases" do
     spawn_clients(1){|client, idx|
+        keys = ["swap:same", "swap:only1", "swap:only2"]
+        [1, 2].each{|db|
+            client.select(db)
+            keys.each{|key| client.del(key)}
+        }
+        client.select(1)
+        assert_equal(client.set("swap:same", "one"), "OK")
+        assert_equal(client.set("swap:only1", "one-only"), "OK")
+        client.select(2)
+        assert_equal(client.set("swap:same", "two"), "OK")
+        assert_equal(client.set("swap:only2", "two-only"), "OK")
+        assert_equal(client.call(["SWAPDB", 1, 2]), "OK")
+        assert_equal(client.get("swap:same"), "one")
+        assert_equal(client.get("swap:only1"), "one-only")
+        assert_nil(client.get("swap:only2"))
+        client.select(1)
+        assert_equal(client.get("swap:same"), "two")
+        assert_equal(client.get("swap:only2"), "two-only")
+        assert_nil(client.get("swap:only1"))
+        [1, 2].each{|db|
+            client.select(db)
+            keys.each{|key| client.del(key)}
+        }
+        client.select(0)
+    }
+end
+
+test "SWAPDB with an empty database and with DB 0" do
+    spawn_clients(1){|client, idx|
+        client.select(0)
+        client.del("swap0:key")
+        client.select(3)
+        client.del("swap0:key")
+        assert_equal(client.set("swap0:key", "db3"), "OK")
+        assert_equal(client.call(["SWAPDB", 0, 3]), "OK")
+        assert_nil(client.get("swap0:key"))
+        client.select(0)
+        assert_equal(client.get("swap0:key"), "db3")
+        # Swap back: DB 0 has the key, DB 3 is empty.
+        assert_equal(client.call(["SWAPDB", 0, 3]), "OK")
+        assert_nil(client.get("swap0:key"))
+        client.select(3)
+        assert_equal(client.get("swap0:key"), "db3")
+        client.del("swap0:key")
+        client.select(0)
+    }
+end
+
+test "SWAPDB preserves TTLs" do
+    spawn_clients(1){|client, idx|
+        client.select(4)
+        client.del("swap:ttl")
+        client.select(5)
+        client.del("swap:ttl")
+        client.select(4)
+        assert_equal(client.set("swap:ttl", "value"), "OK")
+        assert_equal(client.expire("swap:ttl", 1000), true)
+        ttl_before = client.ttl("swap:ttl")
+        assert(ttl_before > 0, "Unexpected TTL before the swap: #{ttl_before}")
+        assert_equal(client.call(["SWAPDB", 4, 5]), "OK")
+        assert_nil(client.get("swap:ttl"))
+        client.select(5)
+        assert_equal(client.get("swap:ttl"), "value")
+        ttl_after = client.ttl("swap:ttl")
+        assert(ttl_after > 0 && ttl_after <= ttl_before,
+               "Unexpected TTL after the swap: #{ttl_after}")
+        client.del("swap:ttl")
+        client.select(0)
+    }
+end
+
+test "SWAPDB edge cases" do
+    spawn_clients(1){|client, idx|
+        # Swapping a database with itself is a no-op.
+        assert_equal(client.call(["SWAPDB", 1, 1]), "OK")
+        begin
+            client.call(["SWAPDB", 0, 99])
+            assert(false, "SWAPDB with an out of range DB should fail")
+        rescue Redis::CommandError => e
+            assert_match(e.message, /DB index is out of range/)
+        end
+        begin
+            client.call(["SWAPDB", "abc", 1])
+            assert(false, "SWAPDB with a non-numeric DB should fail")
+        rescue Redis::CommandError => e
+            assert_match(e.message, /not an integer/)
+        end
+        assert_equal(client.multi, "OK")
         begin
             client.call(["SWAPDB", 0, 1])
-            assert(false, "SWAPDB should not be supported")
+            assert(false, "SWAPDB inside MULTI should fail")
         rescue Redis::CommandError => e
-            assert_match(e.message, /SWAPDB is not supported/)
+            assert_match(e.message, /not supported inside MULTI/)
         end
+        client.discard
     }
 end
 
