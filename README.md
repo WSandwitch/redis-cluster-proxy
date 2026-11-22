@@ -198,7 +198,7 @@ When cross-slot queries are enabled, the proxy can handle multi-key commands who
 - `error`: reject cross-slot write queries with a `CROSSSLOT` error, like a real Redis Cluster does. Use hash tags (eg. `{user}:1`, `{user}:2`) for operations that must be atomic.
 - `lock`: serialize cross-slot write queries using a global lock stored in the cluster, so that two cross-slot write queries issued through **any** proxy using the same protocol cannot interleave.
 
-The lock is stored under the `{__proxy:lock}` key (the hash tag makes every proxy use the same slot). Its TTL and the maximum time a client can wait for it can be configured with `--cross-slot-lock-ttl` and `--cross-slot-lock-timeout`.
+The lock is stored under the `{__proxy:lock}` key (the hash tag makes every proxy use the same slot). Its TTL (default: 10000 ms) and the maximum time a client can wait for it (default: 5000 ms) can be configured with `--cross-slot-lock-ttl` and `--cross-slot-lock-timeout`.
 
 **Limitations of the `lock` policy**:
 - it does **not** block single-key operations: a plain `SET` issued while a cross-slot query holds the lock can still be interleaved with it (use `error` plus hash tags if you need strict atomicity);
@@ -228,7 +228,10 @@ Configuration:
 ```
 databases 16
 db-prefix "%d/"
+db-scan-count 1000
 ```
+
+The same options are available on the command line as `--databases`, `--db-prefix` and `--db-scan-count`.
 
 - `SELECT n` accepts `0 <= n < databases`, replies with `OK` and switches the prefix; other values reply with `DB index is out of range`.
 - `SELECT` is not allowed inside `MULTI` (it could split the transaction across different slots).
