@@ -1,0 +1,44 @@
+# Tests of the upstream Redis suite that cannot pass against the proxy.
+#
+# One test name per line. Lines starting with '#' are comments. A line starting
+# with '/' is a regular expression matched against the test name.
+#
+# Many incompatible tests are already skipped by the tag filters used by
+# run.sh, so they do not need to be listed here:
+#   -needs:debug              DEBUG commands are not exposed
+#   -resp3                    RESP3 is not supported (HELLO 3: NOPROTO)
+#   -needs:repl               replication streams (SYNC/PSYNC) are not supported
+#   -needs:pfdebug            PFDEBUG (a DEBUG command)
+#   -needs:save               persistence commands
+#   -needs:latency            latency monitoring
+#   -needs:local-process      tests that spawn child processes
+#   -needs:config-maxmemory   per-node maxmemory/eviction internals
+#   -needs:config-resetstat   per-node CONFIG RESETSTAT
+#   -cluster:skip             tests the Redis Cluster suite skips itself
+#
+# Keep this list as short as possible: every entry is a documented
+# incompatibility, and entries that start passing again should be removed.
+
+# RESP3 is not supported: some tests are not tagged resp3 upstream.
+/RESP3
+
+# MULTI/EXEC replies are returned by the node as a single array, so the proxy
+# cannot rewrite the key names contained in the individual command replies:
+# physical database prefixes leak into pop replies inside transactions.
+BLPOP inside a transaction
+BLMPOP_LEFT inside a transaction
+
+# SWAPDB is not supported when database emulation is enabled (explicit error).
+SWAPDB awakes blocked client
+
+# CLIENT UNBLOCK cannot work: blocking commands run on private connections
+# with node-side client IDs that are unknown to the proxy's clients.
+client unblock tests
+
+# These tests exercise corrupted encodings through PFDEBUG without the
+# needs:pfdebug tag upstream.
+Corrupted sparse HyperLogLogs doesn't cause overflow and out-of-bounds with XZERO opcode
+Corrupted sparse HyperLogLogs doesn't cause overflow and out-of-bounds with ZERO opcode
+
+# Uses CLIENT UNBLOCK and CONFIG RESETSTAT, and inspects per-node commandstats.
+Blocking command accounted only once in commandstats after timeout

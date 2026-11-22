@@ -393,6 +393,23 @@ The `PROXY` command will allow you to get specific info or perform actions that 
 For a list of all known commands (both supported and unsupported) and their 
 features, see [COMMANDS.md](COMMANDS.md)
 
+# Compatibility testing
+
+Besides the Ruby integration tests in `test/`, the proxy can be checked against
+the upstream Redis test suite (the proxy targets Redis 7.2). The runner starts a
+throw-away cluster and a proxy and executes selected units of the suite in
+"external server" mode:
+
+```sh
+test/upstream/run.sh                       # default subset
+test/upstream/run.sh unit/keyspace         # a single unit
+```
+
+The suite is not vendored: see [test/upstream/README.md](test/upstream/README.md)
+for how to fetch it and for the list of tests that cannot pass because they
+need features the proxy does not provide by design (RESP3, DEBUG, replication
+streams, persistence, ...).
+
 # Current status
 
 This project is currently alpha code that is indented to be evaluated by the community in order to get suggestions and contributions. We discourage its usage in any production environment.
