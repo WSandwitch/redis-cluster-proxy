@@ -389,6 +389,11 @@ The `PROXY` command will allow you to get specific info or perform actions that 
           so that the result will be the total number of keys in the whole
           cluster.
 - SCAN: performs the scan on all the master nodes of the cluster. The cursor returned to the client encodes both the real Redis cursor and the index of the node that has to be scanned next, as `(real_cursor + 1) * 10000 + node_index`. Cursors are plain decimal numbers, so clients can safely convert them to integers. The final cursor (when the scan is complete) is `0`.
+- INFO: collected from all the master nodes. Counter fields that span the whole cluster (currently `blocked_clients` and `rdb_changes_since_last_save`) are summed, so that the proxy behaves like a single instance.
+- MEMORY: `MEMORY USAGE <key>` is routed to the node owning the key (the key is prefixed when database emulation is enabled); the other subcommands are executed on the first master.
+- CLIENT UNBLOCK: returns an explicit error. Blocking commands are executed on private connections, whose node-side client IDs are not the IDs returned by `CLIENT ID`, so unblocking by ID would target the wrong connection.
+- MULTI/EXEC: in database emulation mode the replies of the queued commands are returned by the node as part of a single `EXEC` array, so the proxy cannot strip the database prefix from key names contained in them (e.g. the key returned by a blocking pop executed inside a transaction).
+
 
 For a list of all known commands (both supported and unsupported) and their 
 features, see [COMMANDS.md](COMMANDS.md)

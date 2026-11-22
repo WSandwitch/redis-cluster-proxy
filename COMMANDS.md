@@ -103,6 +103,7 @@ Those commands are supported by Redis Cluster Proxy.
  - LSET
  - LTRIM
  - MGET (**merges multiple replies**)
+ - MEMORY (**USAGE is routed by key, other subcommands use the first master**)
  - MOVE (**atomic between databases**)
  - MSET
  - MSETNX
@@ -227,7 +228,6 @@ Those commands are currently not supported by Redis Cluster Proxy.
  - DEBUG
  - FAILOVER
  - LATENCY
- - MEMORY
  - MIGRATE
  - MODULE
  - MONITOR

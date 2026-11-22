@@ -199,3 +199,105 @@ test "QUIT replies OK and closes the connection" do
     assert_nil(sock.gets("\r\n"), "Connection should be closed after QUIT")
     sock.close
 end
+
+def compat_raw_bytes(data, reads = 1)
+    sock = compat_raw_connect
+    sock.write(data)
+    replies = (0...reads).map{ compat_raw_read(sock) }
+    sock.close
+    replies
+end
+
+# The following tests are regressions found by running the upstream Redis 7.2
+# test suite against the proxy (see test/upstream).
+
+test "Inline protocol: empty queries are ignored" do
+    replies = compat_raw_bytes("\r\nPING\r\n", 1)
+    assert_equal(replies[0], "+PONG")
+    # A bare newline between two commands must not desync the parser.
+    replies = compat_raw_bytes("\nPING\nPING\n", 2)
+    assert_equal(replies, ["+PONG", "+PONG"])
+end
+
+test "Inline protocol: quoted arguments and escapes" do
+    sock = compat_raw_connect
+    begin
+        sock.write("SET \"quoted key\" \"quoted\\x20value\"\r\n")
+        assert_equal(compat_raw_read(sock), "+OK")
+        sock.write("GET \"quoted key\"\r\n")
+        assert_equal(compat_raw_read(sock), "quoted value")
+    ensure
+        sock.close
+    end
+end
+
+test "Inline protocol: unbalanced quotes are a protocol error" do
+    reply = compat_raw_bytes("set \"\"\"test-key\"\"\" test-value\r\n", 1)[0]
+    assert_match(reply, /unbalanced quotes/)
+end
+
+test "Protocol limits are enforced like Redis" do
+    reply = compat_raw_bytes("*1\r\n$2000000000\r\n", 1)[0]
+    assert_match(reply, /invalid bulk length/)
+    reply = compat_raw_bytes("*3000000000\r\n", 1)[0]
+    assert_match(reply, /invalid multibulk length/)
+    reply = compat_raw_bytes("*1\r\nfoo\r\n", 1)[0]
+    assert_match(reply, /expected '\$', got 'f'/)
+end
+
+test "Locally generated arity errors name the command" do
+    assert_match(compat_raw_command("PING", "x", "y", "z"),
+                 /wrong number of arguments for 'ping' command/)
+    assert_match(compat_raw_command("GETEX"),
+                 /wrong number of arguments for 'getex' command/)
+    assert_match(compat_raw_command("SINTERCARD"),
+                 /wrong number of arguments for 'sintercard' command/)
+end
+
+test "XREADGROUP supports NOACK" do
+    spawn_clients(1){|client, idx|
+        client.del("compat:stream")
+        client.call(["XADD", "compat:stream", "*", "f", "v"])
+        client.call(["XGROUP", "CREATE", "compat:stream", "g1", "0"])
+        reply = client.call(["XREADGROUP", "GROUP", "g1", "c1", "NOACK",
+                             "COUNT", "1", "STREAMS", "compat:stream", ">"])
+        assert_not_nil(reply, "XREADGROUP with NOACK returned nil")
+        client.del("compat:stream")
+    }
+end
+
+test "MEMORY USAGE works and CLIENT UNBLOCK is rejected" do
+    spawn_clients(1){|client, idx|
+        assert_equal(client.set("compat:mem", "x"), "OK")
+        usage = client.call(["MEMORY", "USAGE", "compat:mem"])
+        assert(usage.is_a?(Integer) && usage > 0,
+               "Unexpected MEMORY USAGE reply: #{usage.inspect}")
+        err = nil
+        begin
+            client.call(["CLIENT", "UNBLOCK", client.call(["CLIENT", "ID"])])
+        rescue Redis::CommandError => e
+            err = e
+        end
+        assert_not_nil(err, "CLIENT UNBLOCK should return an error")
+        assert_match(err.message, /not supported/)
+        client.del("compat:mem")
+    }
+end
+
+test "GEORADIUS STORE prefixes the destination key in DB mode" do
+    spawn_clients(1){|client, idx|
+        client.select(1)
+        client.del("{geo}src", "{geo}dst")
+        client.call(["GEOADD", "{geo}src", "13.361389", "38.115556",
+                     "Palermo"])
+        client.call(["GEOADD", "{geo}src", "15.087269", "37.502669",
+                     "Catania"])
+        stored = client.call(["GEORADIUS", "{geo}src", "15", "37", "200",
+                              "km", "STORE", "{geo}dst"])
+        assert_equal(stored.to_i, 2)
+        assert_equal(client.call(["ZRANGE", "{geo}dst", "0", "-1"]),
+                     ["Palermo", "Catania"])
+        client.del("{geo}src", "{geo}dst")
+        client.select(0)
+    }
+end

@@ -51,6 +51,9 @@
 #define PARSE_STATUS_OK                     1
 #define UNDEFINED_SLOT                      -1
 #define PROTO_INLINE_MAX_SIZE               (1024*64)
+/* Same limits used by Redis (see networking.c / server.h). */
+#define PROTO_MAX_BULK_LEN                  (512LL*1024*1024)
+#define PROTO_MAX_MULTIBULK_LEN             (1024*1024)
 #define MAX_ASK_RETRIES                     5
 #define PROXY_REDIS_COMPAT_VERSION          "7.2.0"
 /* SCAN cursors returned to clients encode the master node index in the last
@@ -167,6 +170,7 @@ void sigsegvHandler(int sig, siginfo_t *info, void *secret);
 int processItem(redisReader *r);
 
 static sds requestArg(clientRequest *req, int idx);
+static int requestArgEquals(clientRequest *req, int idx, const char *name);
 static int parseIntArg(sds arg, long long *out);
 static int duplicateRequestForAllMasters(clientRequest *req);
 
@@ -718,15 +722,14 @@ int xreadCommand(void *r) {
     int i, blocking = 0;
     for (i = 1; i < req->argc; i++) {
         if (i >= req->offsets_size) break;
-        int offset = req->offsets[i];
-        int len = req->lengths[i];
-        assert(((size_t) (offset + len)) < sdslen(req->buffer));
-        char *arg = req->buffer + offset;
-        blocking = (
-            memcmp(arg, "block", len) == 0 ||
-            memcmp(arg, "BLOCK", len) == 0
-        );
-        if (blocking) break;
+        if (requestArgEquals(req, i, "block")) {
+            blocking = 1;
+            break;
+        }
+        /* Skip the options preceding BLOCK, so that a value equal to
+         * "block" is not mistaken for the option. */
+        if (requestArgEquals(req, i, "count")) i++;
+        else if (requestArgEquals(req, i, "group")) i += 2;
     }
     if (blocking) {
         client *c = req->client;
@@ -753,7 +756,9 @@ int securityWarningCommand(void *r) {
 
 int pingCommand(void *r) {
     clientRequest *req = r;
-    if (req->argc > 1) {
+    if (req->argc > 2) {
+        addReplyErrorWrongArgc(req->client, "ping", req->id);
+    } else if (req->argc > 1) {
         sds msg = requestArg(req, 1);
         if (msg != NULL) {
             addReplyBulkStringLen(req->client, msg, sdslen(msg), req->id);
@@ -1927,6 +1932,56 @@ int copyCommand(void *r) {
     return PROXY_COMMAND_UNHANDLED;
 }
 
+/* MEMORY USAGE <key> [SAMPLES <count>]: the only MEMORY subcommand that needs
+ * a key. The request is routed to the node owning the key, like any other
+ * single-key command; the other subcommands are executed on the first
+ * master (see the CMDFLAG_FIRST_MASTER flag). */
+int memoryCommand(void *r) {
+    clientRequest *req = r;
+    if (req->argc < 3 || !requestArgEquals(req, 1, "usage"))
+        return PROXY_COMMAND_UNHANDLED;
+    sds key = requestArg(req, 2);
+    if (key == NULL) {
+        addReplyError(req->client, ERROR_OOM, req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    sds physical = dbPhysicalKey(req->db, key, sdslen(key));
+    redisCluster *cluster = getCluster(req->client);
+    clusterNode *node = NULL;
+    if (physical != NULL)
+        node = getNodeByKey(cluster, physical, sdslen(physical), NULL);
+    if (physical == NULL || node == NULL) {
+        if (physical != NULL) sdsfree(physical);
+        sdsfree(key);
+        addReplyError(req->client, ERROR_NO_NODE, req->id);
+        return PROXY_COMMAND_HANDLED;
+    }
+    if (dbEmulationEnabled()) {
+        sds *args = requestArgsCopy(req);
+        if (args == NULL) {
+            sdsfree(physical);
+            sdsfree(key);
+            addReplyError(req->client, ERROR_OOM, req->id);
+            return PROXY_COMMAND_HANDLED;
+        }
+        sdsfree(args[2]);
+        args[2] = physical;
+        physical = NULL;
+        int ok = requestSetArgs(req, args, req->argc);
+        freeRequestArgs(args, req->argc);
+        if (!ok) {
+            sdsfree(key);
+            addReplyError(req->client, ERROR_OOM, req->id);
+            return PROXY_COMMAND_HANDLED;
+        }
+        req->keys_prefixed = 1;
+    } else sdsfree(physical);
+    sdsfree(key);
+    req->node = node;
+    req->force_node = 1;
+    return PROXY_COMMAND_UNHANDLED;
+}
+
 /* SORT: BY/GET patterns must be rewritten like KEYS/SCAN patterns. */
 int sortCommand(void *r) {
     clientRequest *req = r;
@@ -2289,7 +2344,12 @@ int clientCommand(void *r) {
     } else if (!strcasecmp(sub, "getredir")) {
         addReplyInt(c, -1, req->id);
     } else if (!strcasecmp(sub, "unblock")) {
-        addReplyInt(c, 0, req->id);
+        /* Blocking commands are executed on private connections, whose
+         * node-side client IDs are unknown to the client. Unblocking would
+         * therefore target the wrong connection: reply with an explicit
+         * error instead of silently doing nothing. */
+        addReplyError(c, "CLIENT UNBLOCK is not supported by the proxy",
+                      req->id);
     } else if (!strcasecmp(sub, "tracking") ||
                !strcasecmp(sub, "caching") ||
                !strcasecmp(sub, "trackinginfo") ||
@@ -3281,14 +3341,31 @@ int zunionInterGetKeys(void *r, int *first_key, int *last_key, int *key_step,
                               req->lengths[2]);
     numkeys = atoi(numkeys_s);
     sdsfree(numkeys_s);
-    *last_key = 2 + numkeys;
-    if (*last_key <= 2) {
-        if (err) *err = "Invalid request format";
-        return -1;
+    if (numkeys <= 0 || numkeys > req->argc) {
+        /* Invalid numkeys: let the node reply with the exact error message
+         * ("at least 1 input key is needed for '...' command"). */
+        *first_key = 0;
+        *last_key = 0;
+        *key_step = 1;
+        return 0;
     }
+    *last_key = 2 + numkeys;
     *key_step = 1;
     numkeys += 1;
     return numkeys;
+}
+
+/* Return 1 if argument `idx` of the request equals `name` (case
+ * insensitive). Unlike memcmp(arg, name, len), this also checks the length,
+ * so that a longer argument or an empty argument is never mistaken for
+ * `name`. */
+static int requestArgEquals(clientRequest *req, int idx, const char *name) {
+    int len;
+    if (idx < 0 || idx >= req->argc || idx >= req->offsets_size) return 0;
+    len = req->lengths[idx];
+    if (len != (int) strlen(name)) return 0;
+    if (len == 0) return 0;
+    return strncasecmp(req->buffer + req->offsets[idx], name, len) == 0;
 }
 
 int xreadGetKeys(void *r, int *first_key, int *last_key, int *key_step,
@@ -3308,21 +3385,16 @@ int xreadGetKeys(void *r, int *first_key, int *last_key, int *key_step,
     }
     int streams_pos = -1;
     for (i = 1; i < req->argc; i++) {
-        char *arg = req->buffer + req->offsets[i];
-        int len = req->lengths[i];
-        if (!memcmp(arg, "block", len) ||
-            !memcmp(arg, "BLOCK", len) ||
-            !memcmp(arg, "count", len) ||
-            !memcmp(arg, "COUNT", len))
+        if (requestArgEquals(req, i, "block") ||
+            requestArgEquals(req, i, "count"))
         {
             i++;
-        } else if (!memcmp(arg, "group", len) ||
-                   !memcmp(arg, "GROUP", len))
-        {
+        } else if (requestArgEquals(req, i, "group")) {
+            /* XREADGROUP GROUP <group> <consumer> ... */
             i += 2;
-        } else if (!memcmp(arg, "streams", len) ||
-                   !memcmp(arg, "STREAMS", len))
-        {
+        } else if (requestArgEquals(req, i, "noack")) {
+            /* Flag without a value (XREADGROUP only). */
+        } else if (requestArgEquals(req, i, "streams")) {
             streams_pos = i;
             break;
         } else break;
@@ -3340,6 +3412,44 @@ int xreadGetKeys(void *r, int *first_key, int *last_key, int *key_step,
 syntax_err:
     if (err) *err = "Syntax error";
     return -1;
+}
+
+/* GEORADIUS/GEORADIUSBYMEMBER have an optional destination key:
+ *   ... [STORE key] [STOREDIST key]
+ * The destination is not contiguous with the source key, so the arguments in
+ * between are added to the skip list. */
+int georadiusGetKeys(void *r, int *first_key, int *last_key, int *key_step,
+                     int **skip, int *skiplen, char **err)
+{
+    clientRequest *req = r;
+    int i, storepos = -1;
+    assert(skip != NULL);
+    assert(skiplen != NULL);
+    *first_key = 1;
+    *last_key = 1;
+    *key_step = 1;
+    *skiplen = 0;
+    for (i = 2; i < req->argc; i++) {
+        if (requestArgEquals(req, i, "store") ||
+            requestArgEquals(req, i, "storedist"))
+        {
+            if (i + 1 < req->argc) storepos = i + 1;
+            i++;
+        }
+    }
+    if (storepos < 0) return 1;
+    *last_key = storepos;
+    *skiplen = storepos - 2;
+    if (*skiplen > 0) {
+        *skip = zmalloc((*skiplen) * sizeof(int));
+        if (*skip == NULL) {
+            if (err) *err = "Failed to alloc memory";
+            *skiplen = 0;
+            return -1;
+        }
+        for (i = 2; i < storepos; i++) (*skip)[i - 2] = i;
+    }
+    return 2;
 }
 
 int sortGetKeys(void *r, int *first_key, int *last_key, int *key_step,
@@ -3361,11 +3471,7 @@ int sortGetKeys(void *r, int *first_key, int *last_key, int *key_step,
     *key_step = 1;
     *skiplen = 0;
     for (i = 2; i < req->argc; i++) {
-        char *arg = req->buffer + req->offsets[i];
-        int len = req->lengths[i];
-        if (!memcmp(arg, "store", len) ||
-            !memcmp(arg, "STORE", len))
-        {
+        if (requestArgEquals(req, i, "store")) {
             storepos = i;
             break;
         }
@@ -3401,10 +3507,20 @@ int evalGetKeys(void *r, int *first_key, int *last_key, int *key_step,
     }
     sds numkeys_s = sdsnewlen(req->buffer + req->offsets[2], req->lengths[2]);
     numkeys = atoi(numkeys_s);
+    sdsfree(numkeys_s);
+    if (numkeys < 0 || numkeys > req->argc) {
+        /* Invalid numkeys: route the command to a node without any key, so
+         * that Redis replies with the exact error message for this command
+         * (EVAL, EVALSHA, FCALL, BZMPOP and BLMPOP all put numkeys at index
+         * 2, but use different messages). */
+        *first_key = 0;
+        *last_key = 0;
+        *key_step = 1;
+        return 0;
+    }
     *first_key = 3;
     *last_key = 2 + numkeys;
     *key_step = 1;
-    sdsfree(numkeys_s);
     return numkeys;
 }
 
@@ -3429,13 +3545,21 @@ int numkeysGetKeys(void *r, int *first_key, int *last_key, int *key_step,
                               req->lengths[1]);
     int numkeys = atoi(numkeys_s);
     sdsfree(numkeys_s);
-    if (numkeys <= 0) {
-        if (err) *err = "Invalid request format";
-        return -1;
+    if (numkeys <= 0 || numkeys > req->argc) {
+        /* Invalid numkeys: let the node reply with the exact error message,
+         * which differs between these commands. */
+        *first_key = 0;
+        *last_key = 0;
+        *key_step = 1;
+        return 0;
     }
     *first_key = 2;
     *last_key = 1 + numkeys;
     *key_step = 1;
+    /* The commands using this callback (SINTERCARD, ZINTERCARD, LMPOP,
+     * ZMPOP, ZUNION, ...) expect at least one more argument after the keys.
+     * If the key range goes past the end of the request, still return the
+     * keys: the node will reply with the appropriate syntax error. */
     return numkeys;
 }
 
@@ -5182,8 +5306,28 @@ static int parseRequest(clientRequest *req, sds *err) {
     }
     char *p = req->buffer + req->query_offset, *nl = NULL;
     sds line = NULL;
-    /* Ensure that parsing always start from a new line. */
-    if (p > req->buffer) {
+    if (req->num_commands == 0) {
+        /* Skip empty queries (a bare '\n' or "\r\n" line): Redis silently
+         * ignores them, and they must not determine the request type, since
+         * an empty inline query can be followed by a multibulk query in the
+         * same pipeline. */
+        while (req->query_offset < buflen) {
+            char ch = req->buffer[req->query_offset];
+            if (ch == '\n') {
+                req->query_offset++;
+            } else if (ch == '\r') {
+                if (req->query_offset + 1 >= buflen) break;
+                if (req->buffer[req->query_offset + 1] != '\n') break;
+                req->query_offset += 2;
+            } else break;
+        }
+        if (req->query_offset >= buflen) {
+            status = PARSE_STATUS_INCOMPLETE;
+            goto cleanup;
+        }
+        p = req->buffer + req->query_offset;
+    } else if (p > req->buffer) {
+        /* Ensure that parsing always start from a new line. */
         if (*p == '\r') {
             p++;
             req->query_offset++;
@@ -5246,7 +5390,8 @@ static int parseRequest(clientRequest *req, sds *err) {
                 line = sdsnewlen(p, len);
                 char *errptr = NULL;
                 lc = (len > 0 ? strtoll(line, &errptr, 10) : 0);
-                if (len <= 0 || errptr != (line + len) || lc > INT_MAX) {
+                if (len <= 0 || errptr != (line + len) ||
+                    lc > PROTO_MAX_MULTIBULK_LEN) {
                     if (err) {
                         *err = sdsnew("Protocol error: invalid multibulk "
                                       "length");
@@ -5310,7 +5455,9 @@ static int parseRequest(clientRequest *req, sds *err) {
                     line = sdsnewlen(p, len);
                     char *errptr = NULL;
                     arglen = (len > 0 ? strtoll(line, &errptr, 10) : -1);
-                    if (len <= 0 || errptr != (line + len) || arglen < 0) {
+                    if (len <= 0 || errptr != (line + len) || arglen < 0 ||
+                        arglen > PROTO_MAX_BULK_LEN)
+                    {
                         if (err) {
                             *err =
                                 sdsnew("Protocol error: invalid bulk length");
@@ -5388,7 +5535,14 @@ static int parseRequest(clientRequest *req, sds *err) {
             }
             nl = strchr(p, '\n');
             if (nl == NULL) {
-                status = PARSE_STATUS_INCOMPLETE;
+                /* Like Redis, keep accepting data until the inline query
+                 * grows too big (this also catches embedded NUL bytes, which
+                 * make strchr() stop before the end of line). */
+                if (((req->buffer + buflen) - p) > PROTO_INLINE_MAX_SIZE) {
+                    if (err)
+                        *err = sdsnew("Protocol error: too big inline request");
+                    status = PARSE_STATUS_ERROR;
+                } else status = PARSE_STATUS_INCOMPLETE;
                 goto cleanup;
             }
             lf_len = 1;
@@ -5398,33 +5552,71 @@ static int parseRequest(clientRequest *req, sds *err) {
             }
             char *qry = p;
             int qrylen = nl - p;
-            int remaining = qrylen;
+            char *line_end = qry + qrylen + lf_len;
+            sds linebuf = NULL;
+            sds *argv = NULL;
+            int argcnt = 0;
             if (qrylen > PROTO_INLINE_MAX_SIZE) {
-                if (err) *err = sdsnew("Protocol error: too big inline string");
-                status = PARSE_STATUS_ERROR;
-                goto cleanup;
-            } else if (qrylen == 0) {
-                if (err) *err = sdsnew("Protocol error: empry inline query");
+                if (err) *err = sdsnew("Protocol error: too big inline request");
                 status = PARSE_STATUS_ERROR;
                 goto cleanup;
             }
-            while (remaining > 0) {
-                int idx = req->argc++;
-                if (!requestMakeRoomForArgs(req, idx)) {
-                    status = PARSE_STATUS_ERROR;
+            linebuf = sdsnewlen(qry, qrylen);
+            if (linebuf == NULL) {
+                if (err) *err = sdsnew(ERROR_OOM);
+                status = PARSE_STATUS_ERROR;
+                goto cleanup;
+            }
+            /* Redis parses inline queries with sdssplitargs(), so quoted
+             * arguments and escapes are supported. This also detects
+             * unbalanced quotes. Note that embedded NUL bytes terminate the
+             * parsing (argcnt == 0), exactly like in Redis. */
+            argv = sdssplitargs(linebuf, &argcnt);
+            sdsfree(linebuf);
+            if (argv == NULL) {
+                if (err)
+                    *err = sdsnew("Protocol error: unbalanced quotes in "
+                                  "request");
+                status = PARSE_STATUS_ERROR;
+                goto cleanup;
+            }
+            if (argcnt == 0) {
+                /* Empty query (or a NUL byte): Redis silently ignores it and
+                 * keeps parsing the rest of the pipeline. */
+                sdsfreesplitres(argv, argcnt);
+                req->query_offset = line_end - req->buffer;
+                p = line_end;
+                if (req->query_offset >= buflen) {
+                    status = PARSE_STATUS_INCOMPLETE;
                     goto cleanup;
                 }
-                char *sep = strchr(p, ' ');
-                if (!sep) sep = nl;
-                req->offsets[idx] = p - req->buffer;
-                req->lengths[idx] = sep - p;
-                p = sep + 1;
-                remaining = nl - p;
+                continue;
+            }
+            /* Keep the rest of the pipeline, which will be moved to a new
+             * request once the arguments of this command have been set. */
+            sds tail = NULL;
+            size_t taillen = (size_t) ((req->buffer + buflen) - line_end);
+            if (taillen > 0) tail = sdsnewlen(line_end, taillen);
+            if (!requestSetArgs(req, argv, argcnt)) {
+                sdsfreesplitres(argv, argcnt);
+                if (tail != NULL) sdsfree(tail);
+                if (err) *err = sdsnew(ERROR_OOM);
+                status = PARSE_STATUS_ERROR;
+                goto cleanup;
+            }
+            sdsfreesplitres(argv, argcnt);
+            req->is_multibulk = 0;
+            req->num_commands = 1;
+            buflen = sdslen(req->buffer);
+            if (tail != NULL) {
+                req->buffer = sdscatlen(req->buffer, tail, sdslen(tail));
+                sdsfree(tail);
+                splitPipelinedQueries(req, req->buffer + req->query_offset,
+                                      1);
+                buflen = sdslen(req->buffer);
             }
             status = PARSE_STATUS_OK;
-            req->num_commands++;
-            p = qry + qrylen + lf_len;
-            req->query_offset = (p - req->buffer);
+            goto cleanup;
         }
     }
 cleanup:
@@ -6265,6 +6457,17 @@ int processRequest(clientRequest *req, int *parsing_status,
         goto invalid_request;
     }
     req->command = cmd;
+    /* Validate the command arity like Redis does, before executing or
+     * routing the command. A positive arity is an exact argument count, a
+     * negative one is a minimum. */
+    if ((cmd->arity > 0 && req->argc != cmd->arity) ||
+        (cmd->arity < 0 && req->argc < -cmd->arity))
+    {
+        addReplyErrorWrongArgc(c, cmd->name, req->id);
+        if (command_name) sdsfree(command_name);
+        if (req != c->multi_request) freeRequest(req);
+        return 1;
+    }
     if (!req->handler_done) {
         req->handler_done = 1;
         if (cmd->handle) {
@@ -7184,6 +7387,62 @@ static sds removeInfoSection(sds payload, const char *section) {
     return payload;
 }
 
+/* Return the value of the numeric INFO field `field` in `info`, or -1 if the
+ * field is not present. */
+static long long infoFieldValue(const char *info, size_t len,
+                                const char *field) {
+    size_t flen = strlen(field);
+    const char *p = info, *end = info + len;
+    while (p < end) {
+        const char *nl = memchr(p, '\n', (size_t) (end - p));
+        size_t line_len = nl ? (size_t) (nl - p) : (size_t) (end - p);
+        if (line_len > flen && !memcmp(p, field, flen) && p[flen] == ':') {
+            return strtoll(p + flen + 1, NULL, 10);
+        }
+        if (nl == NULL) break;
+        p = nl + 1;
+    }
+    return -1;
+}
+
+/* Replace the value of the numeric INFO field `field` with `value`. Return a
+ * new sds (the previous one is freed) or NULL on allocation failure. */
+static sds infoSetField(sds info, const char *field, long long value) {
+    size_t flen = strlen(field), len = sdslen(info);
+    char *p = info, *end = info + len;
+    while (p < end) {
+        char *nl = memchr(p, '\n', (size_t) (end - p));
+        size_t line_len = nl ? (size_t) (nl - p) : (size_t) (end - p);
+        if (line_len > flen && !memcmp(p, field, flen) && p[flen] == ':') {
+            size_t off = (size_t) (p - info);
+            char *val = info + off + flen + 1;
+            size_t rest = len - off - flen - 1;
+            char *valend = memchr(val, '\r', rest);
+            if (valend == NULL) valend = memchr(val, '\n', rest);
+            if (valend == NULL) valend = info + len;
+            sds out = sdsnewlen(info, off + flen + 1);
+            sds tmp;
+            if (out == NULL) return info;
+            tmp = sdscatprintf(out, "%lld", value);
+            if (tmp == NULL) {
+                sdsfree(out);
+                return info;
+            }
+            out = tmp;
+            tmp = sdscatlen(out, valend, len - (size_t) (valend - info));
+            if (tmp == NULL) {
+                sdsfree(out);
+                return info;
+            }
+            sdsfree(info);
+            return tmp;
+        }
+        if (nl == NULL) break;
+        p = nl + 1;
+    }
+    return info;
+}
+
 int getInfoReply(void *_reply, void *_req, char *buf, int len) {
     clientRequest *req = _req;
     client *c = req->client;
@@ -7201,20 +7460,46 @@ int getInfoReply(void *_reply, void *_req, char *buf, int len) {
         }
     } else {
         raxIterator iter;
+        long long blocked_clients = 0, dirty = 0;
+        int has_blocked_clients = 0, has_dirty = 0;
         raxStart(&iter, req->child_replies);
         if (raxSeek(&iter, "^", NULL, 0)) {
             while (raxNext(&iter)) {
                 sds child_reply = (sds) iter.data;
+                sds child_payload = NULL;
+                long long value;
                 if (child_reply == NULL || sdslen(child_reply) == 0) continue;
                 if (child_reply[0] == '-') {
                     if (error == NULL) error = sdsdup(child_reply);
                     continue;
                 }
-                if (payload == NULL) payload = extractBulkPayload(child_reply);
-                if (payload != NULL) break;
+                child_payload = extractBulkPayload(child_reply);
+                if (child_payload == NULL) continue;
+                /* INFO is collected from all the master nodes: counters that
+                 * span the whole cluster are summed, so that the proxy looks
+                 * like a single standalone instance. */
+                value = infoFieldValue(child_payload, sdslen(child_payload),
+                                       "blocked_clients");
+                if (value >= 0) {
+                    blocked_clients += value;
+                    has_blocked_clients = 1;
+                }
+                value = infoFieldValue(child_payload, sdslen(child_payload),
+                                       "rdb_changes_since_last_save");
+                if (value >= 0) {
+                    dirty += value;
+                    has_dirty = 1;
+                }
+                if (payload == NULL) payload = child_payload;
+                else sdsfree(child_payload);
             }
         }
         raxStop(&iter);
+        if (has_blocked_clients && payload != NULL)
+            payload = infoSetField(payload, "blocked_clients", blocked_clients);
+        if (has_dirty && payload != NULL)
+            payload = infoSetField(payload, "rdb_changes_since_last_save",
+                                   dirty);
     }
     if (error != NULL) {
         addReplyRaw(c, error, sdslen(error), req->id);

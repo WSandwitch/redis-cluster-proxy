@@ -48,6 +48,9 @@ int moveCommand(void *req);
 int copyCommand(void *req);
 int swapdbCommand(void *req);
 int sortCommand(void *req);
+int memoryCommand(void *req);
+int georadiusGetKeys(void *r, int *first_key, int *last_key, int *key_step,
+                     int **skip, int *skiplen, char **err);
 
 /* Reply Handlers */
 int mergeReplies(void *reply, void *request, char *buf, int len);
@@ -75,7 +78,7 @@ struct redisCommandDef redisCommandTable[245] = {
     {"randomkey", 1, 0, 0, 0,
      CMDFLAG_HANDLE_REPLY,
      0, NULL, randomkeyCommand, getRandomReply, REPLYKEYS_BULK},
-    {"georadius", -6, 1, 1, 1, 0, 0, NULL, NULL, NULL},
+    {"georadius", -6, 1, 1, 1, 0, 0, georadiusGetKeys, NULL, NULL},
     {"sdiff", -2, 1, -1, 1, 0, 0, NULL, NULL, NULL},
     {"flushdb", -1, 0, 0, 0,
      CMDFLAG_DUPLICATE | CMDFLAG_HANDLE_REPLY,
@@ -219,7 +222,7 @@ struct redisCommandDef redisCommandTable[245] = {
     {"zrevrank", -3, 1, 1, 1, 0, 0, NULL, NULL, NULL},
     {"asking", 1, 0, 0, 0, 0, 0, NULL, readOnlyCommand, NULL},
     {"zremrangebylex", 4, 1, 1, 1, 0, 0, NULL, NULL, NULL},
-    {"georadiusbymember", -5, 1, 1, 1, 0, 0, NULL, NULL, NULL},
+    {"georadiusbymember", -5, 1, 1, 1, 0, 0, georadiusGetKeys, NULL, NULL},
     {"hlen", 2, 1, 1, 1, 0, 0, NULL, NULL, NULL},
     {"renamenx", 3, 1, 2, 1, 0, 0, NULL, NULL, NULL},
     {"acl", -2, 0, 0, 0, 0, 1, NULL, NULL, NULL},
@@ -313,7 +316,9 @@ struct redisCommandDef redisCommandTable[245] = {
     {"linsert", 5, 1, 1, 1, 0, 0, NULL, NULL, NULL},
     {"lpushx", -3, 1, 1, 1, 0, 0, NULL, NULL, NULL},
     {"client", -2, 0, 0, 0, 0, 0, NULL, clientCommand, NULL},
-    {"memory", -2, 0, 0, 0, 0, 1, NULL, NULL, NULL},
+    {"memory", -2, 0, 0, 0,
+     CMDFLAG_FIRST_MASTER,
+     0, NULL, memoryCommand, NULL},
     {"exists", -2, 1, -1, 1, 0, 0, NULL, NULL, sumReplies},
     {"pexpire", -3, 1, 1, 1, 0, 0, NULL, NULL, NULL},
     {"quit", -1, 0, 0, 0, 0, 0, NULL, quitCommand, NULL},
